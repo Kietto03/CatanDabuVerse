@@ -1,0 +1,30 @@
+@import "tailwindcss";
+@import "./theme/tokens.css";
+
+@keyframes shake {
+  0% { transform: translate(0, 0) rotate(0deg); }
+  10% { transform: translate(-3px, 2px) rotate(-3deg); }
+  20% { transform: translate(2px, -3px) rotate(3deg); }
+  30% { transform: translate(-3px, -2px) rotate(-1deg); }
+  40% { transform: translate(3px, 2px) rotate(1deg); }
+  55% { transform: translate(-2px, 3px) rotate(-2deg); }
+  70% { transform: translate(2px, 1px) rotate(2deg); }
+  85% { transform: translate(-2px, -2px) rotate(-1deg); }
+  100% { transform: translate(0, 0) rotate(0deg); }
+}
+
+.animate-shake {
+  animation: shake 0.5s ease-in-out;
+}
+
+/* Loading spinner (board lazy-load fallback + reconnect overlay) */
+@keyframes board-spin { to { transform: rotate(360deg); } }
+.board-spinner {
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  border: 3px solid var(--border-strong);
+  border-top-color: var(--accent);
+  animation: board-spin 0.8s linear infinite;
+}
+

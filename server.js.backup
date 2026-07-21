@@ -1,0 +1,1721 @@
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const path = require('path');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+const PORT = process.env.PORT || 3000;
+
+// Serve static files from root directory
+app.use(express.static(__dirname));
+
+// Game rooms in memory
+const rooms = {};
+
+// Helper to shuffle arrays
+function shuffle(array) {
+  const arr = [...array];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// Bot Names
+const BOT_NAMES_EASY = ["DerpBot", "BillyBot", "SlowBot", "CalmBot", "KindBot"];
+const BOT_NAMES_MEDIUM = ["TradeBot", "BuildBot", "SmartBot", "SteadyBot", "LogicBot"];
+const BOT_NAMES_HARD = ["AlphaBoard", "GrandMaster", "CatanPro", "AggroBot", "DeepCatan"];
+function getBotName(type) {
+  const list = type === 'bot_easy' ? BOT_NAMES_EASY : (type === 'bot_medium' ? BOT_NAMES_MEDIUM : BOT_NAMES_HARD);
+  return list[Math.floor(Math.random() * list.length)] + " [Bot]";
+}
+
+// Generate Catan Board layouts
+function generateBoard(mode) {
+  const R = 60; // hex radius
+  const vertices = [];
+  const edges = [];
+  const edgeMap = new Map();
+
+  function getOrCreateVertex(x, y) {
+    for (let v of vertices) {
+      if (Math.hypot(v.x - x, v.y - y) < 2.0) {
+        return v;
+      }
+    }
+    const newV = {
+      id: vertices.length,
+      x: Math.round(x * 10) / 10,
+      y: Math.round(y * 10) / 10,
+      owner: null,
+      building: null
+    };
+    vertices.push(newV);
+    return newV;
+  }
+
+  function getOrCreateEdge(v1_id, v2_id) {
+    const key = Math.min(v1_id, v2_id) + '-' + Math.max(v1_id, v2_id);
+    if (edgeMap.has(key)) {
+      return edgeMap.get(key);
+    }
+    const newEdge = {
+      id: key,
+      v1: v1_id,
+      v2: v2_id,
+      owner: null
+    };
+    edges.push(newEdge);
+    edgeMap.set(key, newEdge);
+    return newEdge;
+  }
+
+  const hexes = [];
+
+  if (mode === 'seafarers') {
+    // Seafarers: Expanded 37-hex grid (radius 3)
+    // Land: Center 7 hexes (D <= 1) plus 6 corner islets
+    // Water: Rest of the 37 hexes
+    const landResources = shuffle([
+      'wood', 'wood', 'wood', 'sheep', 'sheep', 'sheep',
+      'wheat', 'wheat', 'wheat', 'brick', 'brick', 'ore', 'ore'
+    ]);
+    const landNumbers = shuffle([2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 8, 9, 9, 10, 10, 11, 11, 12]);
+    let numIndex = 0;
+
+    // Islet coordinates
+    const islets = ["3,-3", "-3,3", "0,3", "0,-3", "3,-1", "-3,1"];
+
+    for (let q = -3; q <= 3; q++) {
+      const rStart = Math.max(-3, -q - 3);
+      const rEnd = Math.min(3, -q + 3);
+      for (let r = rStart; r <= rEnd; r++) {
+        // Distance from center (0,0)
+        const d = (Math.abs(q) + Math.abs(r) + Math.abs(q + r)) / 2;
+        const coordKey = `${q},${r}`;
+        const isLand = d <= 1.2 || islets.includes(coordKey);
+
+        const x = R * Math.sqrt(3) * (q + r / 2);
+        const y = R * 1.5 * r;
+
+        let resource, number;
+        if (isLand) {
+          resource = landResources.pop() || 'desert';
+          number = resource === 'desert' ? null : landNumbers[numIndex++];
+        } else {
+          resource = 'water';
+          number = null;
+        }
+
+        const hexVertices = [];
+        const hexEdges = [];
+
+        // Corners
+        for (let i = 0; i < 6; i++) {
+          const theta = (Math.PI / 6) + (i * Math.PI / 3);
+          const vx = x + R * Math.cos(theta);
+          const vy = y + R * Math.sin(theta);
+          const v = getOrCreateVertex(vx, vy);
+          hexVertices.push(v.id);
+        }
+
+        // Edges
+        for (let i = 0; i < 6; i++) {
+          const v1 = hexVertices[i];
+          const v2 = hexVertices[(i + 1) % 6];
+          const e = getOrCreateEdge(v1, v2);
+          hexEdges.push(e.id);
+        }
+
+        hexes.push({
+          q, r,
+          x: Math.round(x * 10) / 10,
+          y: Math.round(y * 10) / 10,
+          resource,
+          number,
+          vertices: hexVertices,
+          edges: hexEdges
+        });
+      }
+    }
+  } else {
+    // Basic or Hero & Knight: Classic 19-hex grid (radius 2)
+    const resourcesList = shuffle([
+      'wood', 'wood', 'wood', 'wood',
+      'sheep', 'sheep', 'sheep', 'sheep',
+      'wheat', 'wheat', 'wheat', 'wheat',
+      'brick', 'brick', 'brick',
+      'ore', 'ore', 'ore',
+      'desert'
+    ]);
+    const numbersList = shuffle([2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 8, 9, 9, 10, 10, 11, 11, 12]);
+    let numIndex = 0;
+
+    for (let q = -2; q <= 2; q++) {
+      const rStart = Math.max(-2, -q - 2);
+      const rEnd = Math.min(2, -q + 2);
+      for (let r = rStart; r <= rEnd; r++) {
+        const x = R * Math.sqrt(3) * (q + r / 2);
+        const y = R * 1.5 * r;
+
+        const resource = resourcesList.pop();
+        const number = resource === 'desert' ? null : numbersList[numIndex++];
+
+        const hexVertices = [];
+        const hexEdges = [];
+
+        // Corners
+        for (let i = 0; i < 6; i++) {
+          const theta = (Math.PI / 6) + (i * Math.PI / 3);
+          const vx = x + R * Math.cos(theta);
+          const vy = y + R * Math.sin(theta);
+          const v = getOrCreateVertex(vx, vy);
+          hexVertices.push(v.id);
+        }
+
+        // Edges
+        for (let i = 0; i < 6; i++) {
+          const v1 = hexVertices[i];
+          const v2 = hexVertices[(i + 1) % 6];
+          const e = getOrCreateEdge(v1, v2);
+          hexEdges.push(e.id);
+        }
+
+        hexes.push({
+          q, r,
+          x: Math.round(x * 10) / 10,
+          y: Math.round(y * 10) / 10,
+          resource,
+          number,
+          vertices: hexVertices,
+          edges: hexEdges
+        });
+      }
+    }
+  }
+
+  return { hexes, vertices, edges };
+}
+
+// Get adjacent vertices
+function getAdjacentVertices(vId, edges) {
+  const adj = [];
+  for (let e of edges) {
+    if (e.v1 === vId) adj.push(e.v2);
+    else if (e.v2 === vId) adj.push(e.v1);
+  }
+  return adj;
+}
+
+// Shuffled deck for Balanced Dice (36 rolls distribution)
+function rollDiceBalanced(room) {
+  if (!room.diceDeck || room.diceDeck.length === 0) {
+    const distribution = [
+      2, 3, 3, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 6,
+      7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 9, 9, 9, 9,
+      10, 10, 10, 11, 11, 12
+    ];
+    room.diceDeck = shuffle(distribution);
+  }
+  const val = room.diceDeck.pop();
+  let d1, d2;
+  do {
+    d1 = Math.floor(Math.random() * 6) + 1;
+    d2 = val - d1;
+  } while (d2 < 1 || d2 > 6);
+  return [d1, d2];
+}
+
+// Sanitize state for transmission
+function getSanitizedRoomState(room, recipientSocketId = null) {
+  return {
+    code: room.code,
+    gameState: room.gameState,
+    gameMode: room.gameMode,
+    hideBankCards: room.hideBankCards,
+    balancedDice: room.balancedDice,
+    victoryPointsLimit: room.victoryPointsLimit,
+    barbarianStep: room.barbarianStep,
+    currentPlayerIndex: room.currentPlayerIndex,
+    setupStep: room.setupStep,
+    setupSubStep: room.setupSubStep,
+    lastSetupSettlement: room.lastSetupSettlement,
+    diceRolled: room.diceRolled,
+    lastDiceRoll: room.lastDiceRoll,
+    board: room.board,
+    winner: room.winner,
+    gameLog: room.gameLog,
+    slots: room.slots.map(s => {
+      const isMe = s.id && s.id === recipientSocketId;
+      return {
+        index: s.index,
+        type: s.type,
+        color: s.color,
+        username: s.username,
+        id: s.id,
+        resources: s.resources,
+        victoryPoints: s.victoryPoints,
+        knights: s.knights,
+        disconnected: s.disconnected,
+        devCards: isMe ? (s.devCards || []) : [],
+        devCardsCount: (s.devCards || []).length
+      };
+    }),
+    bank: room.bank,
+    robberHex: room.robberHex,
+    discardsPending: room.discardsPending
+  };
+}
+
+function broadcastGameState(room) {
+  const code = room.code;
+  const sockets = io.sockets.adapter.rooms.get(code);
+  if (sockets) {
+    for (const socketId of sockets) {
+      const socket = io.sockets.sockets.get(socketId);
+      if (socket) {
+        socket.emit('gameState', getSanitizedRoomState(room, socketId));
+      }
+    }
+  }
+}
+
+// Rotate turns skipping empty slots
+function advanceTurn(room) {
+  let idx = room.currentPlayerIndex;
+  do {
+    idx = (idx + 1) % room.slots.length;
+  } while (room.slots[idx].type === 'empty');
+  room.currentPlayerIndex = idx;
+  room.diceRolled = false;
+}
+
+// Resource collection
+function distributeResources(room, roll) {
+  const dues = {
+    wood: {},
+    brick: {},
+    sheep: {},
+    wheat: {},
+    ore: {}
+  };
+
+  // Find all distributions due
+  for (let hex of room.board.hexes) {
+    if (hex.number === roll && hex.resource !== 'desert' && hex.resource !== 'water') {
+      // Check if robber blocks this hex
+      if (room.robberHex && room.robberHex.q === hex.q && room.robberHex.r === hex.r) {
+        room.gameLog.push(`The Robber blocks resource collection on the ${hex.resource} hex.`);
+        continue;
+      }
+      for (let vId of hex.vertices) {
+        const v = room.board.vertices[vId];
+        if (v.owner !== null) {
+          const slot = room.slots[v.owner];
+          if (slot && slot.type !== 'empty') {
+            const res = hex.resource;
+            const yieldAmt = v.building === 'city' ? 2 : 1;
+            dues[res][slot.index] = (dues[res][slot.index] || 0) + yieldAmt;
+          }
+        }
+      }
+    }
+  }
+
+  const distributionsLog = {}; // Username -> { resource: amount }
+  
+  // Resolve dues resource by resource
+  for (const res of ['wood', 'brick', 'sheep', 'wheat', 'ore']) {
+    const playerDues = dues[res];
+    const playerIndices = Object.keys(playerDues).map(Number);
+    if (playerIndices.length === 0) continue;
+
+    const totalDue = playerIndices.reduce((sum, idx) => sum + playerDues[idx], 0);
+    const eligiblePlayersCount = playerIndices.length;
+    const bankStock = room.bank ? (room.bank[res] || 0) : 19;
+
+    if (totalDue <= bankStock) {
+      // Satisfy all
+      playerIndices.forEach(idx => {
+        const amt = playerDues[idx];
+        const slot = room.slots[idx];
+        slot.resources[res] = (slot.resources[res] || 0) + amt;
+        if (room.bank) room.bank[res] -= amt;
+
+        if (!distributionsLog[slot.username]) {
+          distributionsLog[slot.username] = {};
+        }
+        distributionsLog[slot.username][res] = (distributionsLog[slot.username][res] || 0) + amt;
+      });
+    } else {
+      // Depletion rule
+      if (eligiblePlayersCount === 1) {
+        const idx = playerIndices[0];
+        const slot = room.slots[idx];
+        const given = bankStock;
+        if (given > 0) {
+          slot.resources[res] = (slot.resources[res] || 0) + given;
+          if (room.bank) room.bank[res] = 0;
+
+          if (!distributionsLog[slot.username]) {
+            distributionsLog[slot.username] = {};
+          }
+          distributionsLog[slot.username][res] = (distributionsLog[slot.username][res] || 0) + given;
+          room.gameLog.push(`Bank is low on ${res}! ${slot.username} received only ${given} ${res}.`);
+        } else {
+          room.gameLog.push(`Bank is out of ${res}! ${slot.username} received 0 ${res}.`);
+        }
+      } else {
+        room.gameLog.push(`Bank has insufficient ${res} (${bankStock} left, ${totalDue} needed) to pay all eligible players. No one receives ${res} this turn.`);
+      }
+    }
+  }
+
+  // Write log entries for successful collections
+  const keys = Object.keys(distributionsLog);
+  if (keys.length > 0) {
+    for (let username of keys) {
+      const summary = Object.entries(distributionsLog[username])
+        .map(([res, count]) => `${count} ${res}`)
+        .join(', ');
+      room.gameLog.push(`${username} collected: ${summary}.`);
+    }
+  } else {
+    // Only print "No resources collected" if we didn't print any low/insufficient logs
+    const lastLog = room.gameLog[room.gameLog.length - 1] || "";
+    if (!lastLog.includes("insufficient") && !lastLog.includes("out of") && !lastLog.includes("low on")) {
+      room.gameLog.push('No resources collected.');
+    }
+  }
+}
+
+// Barbarian attack resolver
+function triggerBarbarianAttack(room) {
+  const settlementsCount = room.board.vertices.filter(v => v.owner !== null && v.building === 'settlement').length;
+  let totalKnights = 0;
+  room.slots.forEach(s => {
+    if (s.type !== 'empty') totalKnights += s.knights || 0;
+  });
+
+  room.gameLog.push(`Barbarians Attack! Strength: ${settlementsCount}. Total Knights power: ${totalKnights}.`);
+
+  if (totalKnights >= settlementsCount) {
+    // Defended! Most knights gains 1 VP
+    let maxKnights = -1;
+    room.slots.forEach(s => {
+      if (s.type !== 'empty' && s.knights > maxKnights) maxKnights = s.knights;
+    });
+
+    if (maxKnights > 0) {
+      const winners = room.slots.filter(s => s.type !== 'empty' && s.knights === maxKnights);
+      winners.forEach(w => {
+        w.victoryPoints++;
+        room.gameLog.push(`Defense successful! ${w.username} has the most Knights and receives 1 Victory Point!`);
+        
+        if (w.victoryPoints >= room.victoryPointsLimit) {
+          room.gameState = 'gameover';
+          room.winner = w.username;
+          room.gameLog.push(`${w.username} wins by reaching ${room.victoryPointsLimit} Victory Points!`);
+        }
+      });
+    } else {
+      room.gameLog.push("Defense successful! (No knights were active, but no settlements on board).");
+    }
+  } else {
+    // Defeat! Lowest knights loses 1 settlement
+    let minKnights = Infinity;
+    room.slots.forEach(s => {
+      if (s.type !== 'empty') {
+        const hasSettlement = room.board.vertices.some(v => v.owner === s.index && v.building === 'settlement');
+        if (hasSettlement && s.knights < minKnights) {
+          minKnights = s.knights;
+        }
+      }
+    });
+
+    const candidates = [];
+    if (minKnights !== Infinity) {
+      room.slots.forEach(s => {
+        if (s.type !== 'empty' && s.knights === minKnights) {
+          const hasSettlement = room.board.vertices.some(v => v.owner === s.index && v.building === 'settlement');
+          if (hasSettlement) candidates.push(s);
+        }
+      });
+    }
+
+    if (candidates.length > 0) {
+      candidates.forEach(c => {
+        const vertex = room.board.vertices.find(v => v.owner === c.index && v.building === 'settlement');
+        if (vertex) {
+          vertex.owner = null;
+          vertex.building = null;
+          c.victoryPoints = Math.max(0, c.victoryPoints - 1);
+          room.gameLog.push(`Defense failed! ${c.username} had the fewest Knights and lost 1 settlement.`);
+        }
+      });
+    } else {
+      room.gameLog.push("Defense failed! But no players had settlements to destroy.");
+    }
+  }
+  room.barbarianStep = 0;
+}
+
+// Bot AI helper checkers
+function hasResourcesForSettlement(slot) {
+  const r = slot.resources;
+  return (r.wood >= 1 && r.brick >= 1 && r.sheep >= 1 && r.wheat >= 1);
+}
+
+function hasResourcesForRoad(slot) {
+  const r = slot.resources;
+  return (r.wood >= 1 && r.brick >= 1);
+}
+
+function botTradeIfNeeded(room, slot) {
+  const r = slot.resources;
+  const needs = ['wood', 'brick', 'sheep', 'wheat'];
+  const missing = needs.filter(res => (r[res] || 0) < 1);
+  if (missing.length === 1) {
+    const target = missing[0];
+    if (room.bank && room.bank[target] >= 1) {
+      for (let res of ['wood', 'brick', 'sheep', 'wheat', 'ore']) {
+        if (res !== target && r[res] >= 4) {
+          r[res] -= 4;
+          r[target]++;
+          room.bank[res] = Math.min(19, room.bank[res] + 4);
+          room.bank[target]--;
+          room.gameLog.push(`${slot.username} traded 4 ${res} for 1 ${target} with the Bank.`);
+          return;
+        }
+      }
+    }
+  }
+
+  const roadNeeds = ['wood', 'brick'];
+  const roadMissing = roadNeeds.filter(res => (r[res] || 0) < 1);
+  if (roadMissing.length === 1) {
+    const target = roadMissing[0];
+    if (room.bank && room.bank[target] >= 1) {
+      for (let res of ['wood', 'brick', 'sheep', 'wheat', 'ore']) {
+        if (res !== target && r[res] >= 4) {
+          r[res] -= 4;
+          r[target]++;
+          room.bank[res] = Math.min(19, room.bank[res] + 4);
+          room.bank[target]--;
+          room.gameLog.push(`${slot.username} traded 4 ${res} for 1 ${target} with the Bank.`);
+          return;
+        }
+      }
+    }
+  }
+}
+
+// Server Bot AI Turn Controller
+function scheduleBotAction(roomCode) {
+  const room = rooms[roomCode];
+  if (!room || room.gameState === 'lobby' || room.gameState === 'gameover') return;
+
+  const activeSlot = room.slots[room.currentPlayerIndex];
+  if (!activeSlot || !activeSlot.type.startsWith('bot')) return;
+
+  if (room.gameState === 'robberMove') {
+    setTimeout(() => {
+      const rCheck = rooms[roomCode];
+      if (!rCheck || rCheck.gameState !== 'robberMove' || rCheck.currentPlayerIndex !== activeSlot.index) return;
+
+      const currentRobber = rCheck.robberHex;
+      const validHexes = rCheck.board.hexes.filter(h => 
+        h.resource !== 'water' && 
+        !(currentRobber && currentRobber.q === h.q && currentRobber.r === h.r)
+      );
+
+      if (validHexes.length > 0) {
+        const hexChoice = validHexes[Math.floor(Math.random() * validHexes.length)];
+        rCheck.robberHex = { q: hexChoice.q, r: hexChoice.r };
+        rCheck.gameLog.push(`${activeSlot.username} moved the Robber.`);
+
+        const adjacentPlayers = [];
+        hexChoice.vertices.forEach(vId => {
+          const v = rCheck.board.vertices[vId];
+          if (v && v.owner !== null && v.owner !== activeSlot.index) {
+            const ownerSlot = rCheck.slots[v.owner];
+            if (ownerSlot && ownerSlot.type !== 'empty') {
+              const totalRes = Object.values(ownerSlot.resources).reduce((a, b) => a + b, 0);
+              if (totalRes > 0 && !adjacentPlayers.includes(ownerSlot.index)) {
+                adjacentPlayers.push(ownerSlot.index);
+              }
+            }
+          }
+        });
+
+        if (adjacentPlayers.length > 0) {
+          const targetIdx = adjacentPlayers[Math.floor(Math.random() * adjacentPlayers.length)];
+          const targetSlot = rCheck.slots[targetIdx];
+          const resources = ['wood', 'brick', 'sheep', 'wheat', 'ore'];
+          const available = resources.filter(res => targetSlot.resources[res] > 0);
+          if (available.length > 0) {
+            const stolen = available[Math.floor(Math.random() * available.length)];
+            targetSlot.resources[stolen]--;
+            activeSlot.resources[stolen]++;
+            rCheck.gameLog.push(`${activeSlot.username} stole 1 card from ${targetSlot.username}.`);
+          }
+        }
+
+        rCheck.gameState = 'playing';
+        rCheck.diceRolled = true;
+
+        io.to(roomCode).emit('gameState', getSanitizedRoomState(rCheck));
+        scheduleBotAction(roomCode);
+      }
+    }, 1200);
+    return;
+  }
+
+  if (room.gameState === 'setup') {
+    setTimeout(() => {
+      const rCheck = rooms[roomCode];
+      if (!rCheck || rCheck.gameState !== 'setup' || rCheck.currentPlayerIndex !== activeSlot.index) return;
+
+      if (rCheck.setupSubStep === 'settlement') {
+        // Find valid vertex for starting settlement
+        const valVertices = [];
+        rCheck.board.vertices.forEach(v => {
+          if (v.owner === null) {
+            const adj = getAdjacentVertices(v.id, rCheck.board.edges);
+            const close = adj.some(adjId => rCheck.board.vertices[adjId].owner !== null);
+            if (!close) valVertices.push(v.id);
+          }
+        });
+
+        if (valVertices.length > 0) {
+          const choice = valVertices[Math.floor(Math.random() * valVertices.length)];
+          const vertex = rCheck.board.vertices[choice];
+          vertex.owner = activeSlot.index;
+          vertex.building = 'settlement';
+          activeSlot.victoryPoints++;
+          rCheck.lastSetupSettlement = choice;
+          rCheck.setupSubStep = 'road';
+          rCheck.gameLog.push(`${activeSlot.username} placed a starting settlement.`);
+
+          // Distribute resources on second setup settlement placement
+          const N = rCheck.slots.length;
+          if (rCheck.setupStep >= N) {
+            for (let hex of rCheck.board.hexes) {
+              if (hex.vertices.includes(choice)) {
+                if (hex.resource !== 'desert' && hex.resource !== 'water') {
+                  if (rCheck.bank && rCheck.bank[hex.resource] > 0) {
+                    rCheck.bank[hex.resource]--;
+                    activeSlot.resources[hex.resource] = (activeSlot.resources[hex.resource] || 0) + 1;
+                    rCheck.gameLog.push(`${activeSlot.username} received starting resource: 1 ${hex.resource}.`);
+                  } else {
+                    rCheck.gameLog.push(`${activeSlot.username} could not receive starting resource: 1 ${hex.resource} (Bank out of stock).`);
+                  }
+                }
+              }
+            }
+          }
+
+          io.to(roomCode).emit('gameState', getSanitizedRoomState(rCheck));
+          
+          scheduleBotAction(roomCode);
+        }
+      } else if (rCheck.setupSubStep === 'road') {
+        // Find valid edge adjacent to newly built settlement
+        const valEdges = [];
+        rCheck.board.edges.forEach(e => {
+          if (e.owner === null && (e.v1 === rCheck.lastSetupSettlement || e.v2 === rCheck.lastSetupSettlement)) {
+            valEdges.push(e.id);
+          }
+        });
+
+        if (valEdges.length > 0) {
+          const choice = valEdges[Math.floor(Math.random() * valEdges.length)];
+          const edge = rCheck.board.edges.find(e => e.id === choice);
+          edge.owner = activeSlot.index;
+          rCheck.gameLog.push(`${activeSlot.username} placed a starting road.`);
+
+          const N = rCheck.slots.length;
+          rCheck.setupStep++;
+          rCheck.setupSubStep = 'settlement';
+          rCheck.lastSetupSettlement = null;
+
+          if (rCheck.setupStep === 2 * N) {
+            rCheck.gameState = 'playing';
+            rCheck.currentPlayerIndex = 0;
+            rCheck.diceRolled = false;
+            rCheck.gameLog.push("Setup complete! Match gameplay starts. Roll the dice!");
+          } else {
+            let nextActiveIdx;
+            if (rCheck.setupStep < N) {
+              nextActiveIdx = rCheck.setupStep;
+            } else {
+              nextActiveIdx = 2 * N - 1 - rCheck.setupStep;
+            }
+            rCheck.currentPlayerIndex = nextActiveIdx;
+            const targetSlot = rCheck.slots[nextActiveIdx];
+            rCheck.gameLog.push(`It is now ${targetSlot.username}'s turn to place.`);
+          }
+
+          io.to(roomCode).emit('gameState', getSanitizedRoomState(rCheck));
+          scheduleBotAction(roomCode);
+        }
+      }
+    }, 1200);
+  } else if (room.gameState === 'playing') {
+    setTimeout(() => {
+      const rCheck = rooms[roomCode];
+      if (!rCheck || rCheck.gameState !== 'playing' || rCheck.currentPlayerIndex !== activeSlot.index) return;
+
+      if (!rCheck.diceRolled) {
+        // Roll dice stage
+        let d1, d2;
+        if (rCheck.balancedDice) {
+          [d1, d2] = rollDiceBalanced(rCheck);
+        } else {
+          d1 = Math.floor(Math.random() * 6) + 1;
+          d2 = Math.floor(Math.random() * 6) + 1;
+        }
+        const total = d1 + d2;
+        rCheck.lastDiceRoll = [d1, d2];
+        rCheck.diceRolled = true;
+        rCheck.gameLog.push(`${activeSlot.username} rolled a ${total} (${d1} + ${d2}).`);
+
+        if (total !== 7) {
+          distributeResources(rCheck, total);
+          io.to(roomCode).emit('gameState', getSanitizedRoomState(rCheck));
+          io.to(roomCode).emit('sound', 'roll');
+          scheduleBotAction(roomCode);
+        } else {
+          rCheck.gameLog.push("A 7 was rolled! The Robber is activated.");
+          if (rCheck.gameMode === 'heroknight') {
+            rCheck.barbarianStep++;
+            rCheck.gameLog.push(`Barbarians advanced! Threat level: ${rCheck.barbarianStep}/7`);
+            if (rCheck.barbarianStep === 7) {
+              triggerBarbarianAttack(rCheck);
+            }
+          }
+
+          // Check discards
+          const discardsPending = {};
+          rCheck.slots.forEach(slot => {
+            if (slot.type !== 'empty') {
+              const totalCards = Object.values(slot.resources).reduce((sum, count) => sum + count, 0);
+              if (totalCards > 7) {
+                discardsPending[slot.index] = Math.floor(totalCards / 2);
+              }
+            }
+          });
+          rCheck.discardsPending = discardsPending;
+
+          // Bot discards
+          rCheck.slots.forEach(slot => {
+            if (slot.type !== 'empty' && slot.type.startsWith('bot') && rCheck.discardsPending[slot.index]) {
+              const cardsToDiscard = rCheck.discardsPending[slot.index];
+              let discardedCount = 0;
+              const resources = ['wood', 'brick', 'sheep', 'wheat', 'ore'];
+              while (discardedCount < cardsToDiscard) {
+                const available = resources.filter(res => slot.resources[res] > 0);
+                if (available.length === 0) break;
+                const chosen = available[Math.floor(Math.random() * available.length)];
+                slot.resources[chosen]--;
+                rCheck.bank[chosen] = Math.min(19, rCheck.bank[chosen] + 1);
+                discardedCount++;
+              }
+              rCheck.gameLog.push(`${slot.username} discarded ${cardsToDiscard} cards.`);
+              delete rCheck.discardsPending[slot.index];
+            }
+          });
+
+          if (Object.keys(rCheck.discardsPending).length > 0) {
+            rCheck.gameState = 'discard';
+          } else {
+            rCheck.gameState = 'robberMove';
+          }
+
+          io.to(roomCode).emit('gameState', getSanitizedRoomState(rCheck));
+          io.to(roomCode).emit('sound', 'roll');
+          scheduleBotAction(roomCode);
+        }
+      } else {
+        // Build stage
+        botTradeIfNeeded(rCheck, activeSlot);
+
+        let builtSomething = false;
+
+        // Try to build settlement
+        if (hasResourcesForSettlement(activeSlot)) {
+          const valVertices = [];
+          rCheck.board.vertices.forEach(v => {
+            if (v.owner === null) {
+              const adj = getAdjacentVertices(v.id, rCheck.board.edges);
+              const tooClose = adj.some(adjId => rCheck.board.vertices[adjId].owner !== null);
+              if (!tooClose) {
+                let roadConn = rCheck.board.edges.some(e => (e.v1 === v.id || e.v2 === v.id) && e.owner === activeSlot.index);
+                if (roadConn) valVertices.push(v.id);
+              }
+            }
+          });
+
+          if (valVertices.length > 0) {
+            const choice = valVertices[Math.floor(Math.random() * valVertices.length)];
+            const vertex = rCheck.board.vertices[choice];
+            activeSlot.resources.wood--;
+            activeSlot.resources.brick--;
+            activeSlot.resources.wheat--;
+            activeSlot.resources.sheep--;
+            if (rCheck.bank) {
+              rCheck.bank.wood = Math.min(19, rCheck.bank.wood + 1);
+              rCheck.bank.brick = Math.min(19, rCheck.bank.brick + 1);
+              rCheck.bank.wheat = Math.min(19, rCheck.bank.wheat + 1);
+              rCheck.bank.sheep = Math.min(19, rCheck.bank.sheep + 1);
+            }
+            vertex.owner = activeSlot.index;
+            vertex.building = 'settlement';
+            activeSlot.victoryPoints++;
+            rCheck.gameLog.push(`${activeSlot.username} built a settlement.`);
+            builtSomething = true;
+
+            if (activeSlot.victoryPoints >= rCheck.victoryPointsLimit) {
+              rCheck.gameState = 'gameover';
+              rCheck.winner = activeSlot.username;
+              rCheck.gameLog.push(`${activeSlot.username} reaches ${rCheck.victoryPointsLimit} Victory Points and wins!`);
+            }
+          }
+        }
+
+        // Try to train Knight
+        if (!builtSomething && rCheck.gameMode === 'heroknight' && activeSlot.resources.ore >= 1 && activeSlot.resources.sheep >= 1) {
+          activeSlot.resources.ore--;
+          activeSlot.resources.sheep--;
+          if (rCheck.bank) {
+            rCheck.bank.ore = Math.min(19, rCheck.bank.ore + 1);
+            rCheck.bank.sheep = Math.min(19, rCheck.bank.sheep + 1);
+          }
+          activeSlot.knights++;
+          rCheck.gameLog.push(`${activeSlot.username} trained a Knight (Total Knight Power: ${activeSlot.knights}).`);
+          builtSomething = true;
+        }
+
+        // Try to build road
+        if (!builtSomething && hasResourcesForRoad(activeSlot)) {
+          const valEdges = [];
+          rCheck.board.edges.forEach(edge => {
+            if (edge.owner === null) {
+              let hasConn = false;
+              if (rCheck.board.vertices[edge.v1].owner === activeSlot.index || rCheck.board.vertices[edge.v2].owner === activeSlot.index) {
+                hasConn = true;
+              }
+              if (!hasConn) {
+                hasConn = rCheck.board.edges.some(e => e.id !== edge.id && e.owner === activeSlot.index && (e.v1 === edge.v1 || e.v1 === edge.v2 || e.v2 === edge.v1 || e.v2 === edge.v2));
+              }
+              if (hasConn) valEdges.push(edge.id);
+            }
+          });
+
+          if (valEdges.length > 0) {
+            const choice = valEdges[Math.floor(Math.random() * valEdges.length)];
+            const edge = rCheck.board.edges.find(e => e.id === choice);
+            activeSlot.resources.wood--;
+            activeSlot.resources.brick--;
+            if (rCheck.bank) {
+              rCheck.bank.wood = Math.min(19, rCheck.bank.wood + 1);
+              rCheck.bank.brick = Math.min(19, rCheck.bank.brick + 1);
+            }
+            edge.owner = activeSlot.index;
+            rCheck.gameLog.push(`${activeSlot.username} built a road.`);
+            builtSomething = true;
+          }
+        }
+
+        // Schedule End turn
+        setTimeout(() => {
+          const rCheck2 = rooms[roomCode];
+          if (!rCheck2 || rCheck2.currentPlayerIndex !== activeSlot.index) return;
+
+          advanceTurn(rCheck2);
+          const nextPlayer = rCheck2.slots[rCheck2.currentPlayerIndex];
+          rCheck2.gameLog.push(`It is now ${nextPlayer.username}'s turn.`);
+
+          io.to(roomCode).emit('gameState', getSanitizedRoomState(rCheck2));
+          scheduleBotAction(roomCode);
+        }, 1200);
+
+        if (builtSomething) {
+          io.to(roomCode).emit('gameState', getSanitizedRoomState(rCheck));
+          io.to(roomCode).emit('sound', 'build');
+        }
+      }
+    }, 1500);
+  }
+}
+
+// Socket handlers
+io.on('connection', (socket) => {
+  console.log(`Socket connected: ${socket.id}`);
+
+  // Host creates custom room configuration
+  socket.on('createRoom', ({ roomCode, username, gameMode, hideBankCards, balancedDice, victoryPointsLimit, slots }) => {
+    const code = roomCode.trim().toUpperCase();
+    const name = username.trim();
+
+    if (!code || !name) {
+      socket.emit('errorMsg', 'Invalid room code or username.');
+      return;
+    }
+
+    if (rooms[code]) {
+      socket.emit('errorMsg', 'Room code is already active.');
+      return;
+    }
+
+    // Set up slot structures
+    const initializedSlots = slots.map((s, idx) => {
+      let uName = null;
+      let sId = null;
+
+      if (s.type === 'human') {
+        if (idx === 0) {
+          uName = name;
+          sId = socket.id;
+        }
+      } else if (s.type.startsWith('bot')) {
+        uName = getBotName(s.type);
+      }
+
+      return {
+        index: idx,
+        type: s.type,
+        color: s.color,
+        username: uName,
+        id: sId,
+        resources: { wood: 0, brick: 0, sheep: 0, wheat: 0, ore: 0 },
+        victoryPoints: 0,
+        knights: 0,
+        devCards: [],
+        disconnected: false
+      };
+    });
+
+    const board = generateBoard(gameMode);
+    const desertHex = board.hexes.find(h => h.resource === 'desert');
+    const room = {
+      code,
+      gameState: 'lobby',
+      gameMode,
+      hideBankCards,
+      balancedDice,
+      victoryPointsLimit: Number(victoryPointsLimit) || 10,
+      barbarianStep: 0,
+      slots: initializedSlots,
+      currentPlayerIndex: 0,
+      setupStep: 0,
+      setupSubStep: 'settlement',
+      lastSetupSettlement: null,
+      diceRolled: false,
+      lastDiceRoll: null,
+      board,
+      winner: null,
+      gameLog: [`Room ${code} created.`, `${name} joined as host.`],
+      bank: { wood: 19, brick: 19, sheep: 19, wheat: 19, ore: 19 },
+      robberHex: desertHex ? { q: desertHex.q, r: desertHex.r } : { q: 0, r: 0 },
+      discardsPending: {}
+    };
+
+    rooms[code] = room;
+
+    socket.roomCode = code;
+    socket.username = name;
+    socket.join(code);
+
+    broadcastGameState(room);
+  });
+
+  // Client joining room
+  socket.on('joinRoom', ({ roomCode, username }) => {
+    const code = roomCode.trim().toUpperCase();
+    const name = username.trim();
+
+    if (!code || !name) {
+      socket.emit('errorMsg', 'Invalid room code or username.');
+      return;
+    }
+
+    const room = rooms[code];
+    if (!room) {
+      socket.emit('errorMsg', 'Room not found.');
+      return;
+    }
+
+    // Check if player is reconnecting
+    let existingSlot = room.slots.find(s => s.username === name && s.type === 'human');
+    if (existingSlot) {
+      if (existingSlot.disconnected) {
+        existingSlot.id = socket.id;
+        existingSlot.disconnected = false;
+        socket.roomCode = code;
+        socket.username = name;
+        socket.join(code);
+        room.gameLog.push(`${name} reconnected.`);
+        broadcastGameState(room);
+        return;
+      } else {
+        socket.emit('errorMsg', 'Username is already active in this room.');
+        return;
+      }
+    }
+
+    if (room.gameState !== 'lobby') {
+      socket.emit('errorMsg', 'Game has already started.');
+      return;
+    }
+
+    // Find first empty slot
+    const openSlot = room.slots.find(s => s.type === 'human' && s.username === null);
+    if (!openSlot) {
+      socket.emit('errorMsg', 'Room is full.');
+      return;
+    }
+
+    openSlot.id = socket.id;
+    openSlot.username = name;
+    openSlot.disconnected = false;
+    room.gameLog.push(`${name} joined the room.`);
+
+    socket.roomCode = code;
+    socket.username = name;
+    socket.join(code);
+
+    broadcastGameState(room);
+  });
+
+  // Start game
+  socket.on('startGame', () => {
+    const code = socket.roomCode;
+    const room = rooms[code];
+    if (!room) return;
+
+    if (room.gameState !== 'lobby') return;
+
+    // Filter out empty slots
+    let activeSlots = room.slots.filter(s => s.type !== 'empty');
+    if (activeSlots.length === 0) {
+      socket.emit('errorMsg', 'Cannot start a game with no players.');
+      return;
+    }
+
+    // Randomly shuffle active player order
+    activeSlots = shuffle(activeSlots);
+
+    // Re-assign indices to match their position in the new slots array
+    activeSlots.forEach((s, idx) => {
+      s.index = idx;
+      s.devCards = []; // ensure empty array is ready
+    });
+
+    // Initialize development card deck (25 cards total)
+    const devDeck = [];
+    for (let i = 0; i < 14; i++) devDeck.push('Knight');
+    for (let i = 0; i < 5; i++) devDeck.push('Victory Point');
+    for (let i = 0; i < 2; i++) devDeck.push('Road Building');
+    for (let i = 0; i < 2; i++) devDeck.push('Year of Plenty');
+    for (let i = 0; i < 2; i++) devDeck.push('Monopoly');
+    room.devCardsDeck = shuffle(devDeck);
+
+    room.slots = activeSlots;
+    room.gameState = 'setup';
+    room.setupStep = 0;
+    room.setupSubStep = 'settlement';
+    room.currentPlayerIndex = 0;
+    
+    room.gameLog.push('The game has started! Player order has been randomized.');
+    const orderNames = room.slots.map(s => s.username).join(' -> ');
+    room.gameLog.push(`Player Order: ${orderNames}`);
+    room.gameLog.push(`It is now ${room.slots[0].username}'s turn. Setup Phase: Place your first settlement.`);
+    broadcastGameState(room);
+
+    // Schedule bots if first turn is bot
+    scheduleBotAction(code);
+  });
+
+  // Build settlement
+  socket.on('buildSettlement', (rawVertexId) => {
+    const code = socket.roomCode;
+    const room = rooms[code];
+    if (!room) return;
+
+    const slotIndex = room.currentPlayerIndex;
+    const activePlayer = room.slots[slotIndex];
+
+    if (!activePlayer || activePlayer.id !== socket.id) {
+      socket.emit('errorMsg', 'It is not your turn.');
+      return;
+    }
+
+    const vertexId = Number(rawVertexId);
+    const vertex = room.board.vertices[vertexId];
+    if (!vertex || vertex.owner !== null) {
+      socket.emit('errorMsg', 'Settlement already exists here or path is invalid.');
+      return;
+    }
+
+    const adj = getAdjacentVertices(vertexId, room.board.edges);
+    for (let adjId of adj) {
+      if (room.board.vertices[adjId].owner !== null) {
+        socket.emit('errorMsg', 'Violates distance rule (too close to another settlement).');
+        return;
+      }
+    }
+
+    if (room.gameState === 'setup') {
+      if (room.setupSubStep !== 'settlement') return;
+
+      vertex.owner = activePlayer.index;
+      vertex.building = 'settlement';
+      activePlayer.victoryPoints++;
+
+      room.lastSetupSettlement = vertexId;
+      room.setupSubStep = 'road';
+      room.gameLog.push(`${activePlayer.username} placed a starting settlement.`);
+
+      // Distribute resources on second setup settlement placement
+      const N = room.slots.length;
+      if (room.setupStep >= N) {
+        for (let hex of room.board.hexes) {
+          if (hex.vertices.includes(vertexId)) {
+            if (hex.resource !== 'desert' && hex.resource !== 'water') {
+              if (room.bank && room.bank[hex.resource] > 0) {
+                room.bank[hex.resource]--;
+                activePlayer.resources[hex.resource] = (activePlayer.resources[hex.resource] || 0) + 1;
+                room.gameLog.push(`${activePlayer.username} received starting resource: 1 ${hex.resource}.`);
+              } else {
+                room.gameLog.push(`${activePlayer.username} could not receive starting resource: 1 ${hex.resource} (Bank out of stock).`);
+              }
+            }
+          }
+        }
+      }
+
+      io.to(code).emit('gameState', getSanitizedRoomState(room));
+      socket.emit('sound', 'build');
+
+    } else if (room.gameState === 'playing') {
+      if (!room.diceRolled) return;
+
+      const r = activePlayer.resources;
+      if (r.wood < 1 || r.brick < 1 || r.wheat < 1 || r.sheep < 1) {
+        socket.emit('errorMsg', 'Insufficient resources.');
+        return;
+      }
+
+      let hasRoadConn = false;
+      for (let e of room.board.edges) {
+        if ((e.v1 === vertexId || e.v2 === vertexId) && e.owner === activePlayer.index) {
+          hasRoadConn = true;
+          break;
+        }
+      }
+
+      if (!hasRoadConn) {
+        socket.emit('errorMsg', 'Must connect to one of your roads.');
+        return;
+      }
+
+      r.wood--; r.brick--; r.wheat--; r.sheep--;
+      if (room.bank) {
+        room.bank.wood = Math.min(19, room.bank.wood + 1);
+        room.bank.brick = Math.min(19, room.bank.brick + 1);
+        room.bank.wheat = Math.min(19, room.bank.wheat + 1);
+        room.bank.sheep = Math.min(19, room.bank.sheep + 1);
+      }
+      vertex.owner = activePlayer.index;
+      vertex.building = 'settlement';
+      activePlayer.victoryPoints++;
+
+      room.gameLog.push(`${activePlayer.username} built a settlement.`);
+
+      if (activePlayer.victoryPoints >= room.victoryPointsLimit) {
+        room.gameState = 'gameover';
+        room.winner = activePlayer.username;
+        room.gameLog.push(`${activePlayer.username} won the match by reaching ${room.victoryPointsLimit} Victory Points!`);
+      }
+
+      broadcastGameState(room);
+      socket.emit('sound', 'build');
+    }
+  });
+
+  // Upgrade Settlement to City
+  socket.on('buildCity', (rawVertexId) => {
+    const code = socket.roomCode;
+    const room = rooms[code];
+    if (!room) return;
+
+    const slotIndex = room.currentPlayerIndex;
+    const activePlayer = room.slots[slotIndex];
+
+    if (!activePlayer || activePlayer.id !== socket.id) {
+      socket.emit('errorMsg', 'It is not your turn.');
+      return;
+    }
+
+    if (room.gameState !== 'playing') {
+      socket.emit('errorMsg', 'Game is not in active playing phase.');
+      return;
+    }
+
+    if (!room.diceRolled) {
+      socket.emit('errorMsg', 'Must roll dice first.');
+      return;
+    }
+
+    const vertexId = Number(rawVertexId);
+    const vertex = room.board.vertices[vertexId];
+    if (!vertex) {
+      socket.emit('errorMsg', 'Invalid vertex selected.');
+      return;
+    }
+
+    if (vertex.owner !== activePlayer.index) {
+      socket.emit('errorMsg', 'You do not own this node.');
+      return;
+    }
+
+    if (vertex.building !== 'settlement') {
+      socket.emit('errorMsg', 'You can only upgrade an existing settlement to a city.');
+      return;
+    }
+
+    const r = activePlayer.resources;
+    if (r.ore < 3 || r.wheat < 2) {
+      socket.emit('errorMsg', 'Insufficient resources to build a City. Requires 3 Ore and 2 Wheat.');
+      return;
+    }
+
+    // Deduct resources
+    r.ore -= 3;
+    r.wheat -= 2;
+    if (room.bank) {
+      room.bank.ore = Math.min(19, room.bank.ore + 3);
+      room.bank.wheat = Math.min(19, room.bank.wheat + 2);
+    }
+
+    // Upgrade building
+    vertex.building = 'city';
+    activePlayer.victoryPoints++; // Upgrade settlement (1 VP) to city (2 VP) gives +1 VP
+
+    room.gameLog.push(`${activePlayer.username} upgraded a settlement to a City.`);
+
+    // Check win condition (including VP dev cards)
+    const vpCards = (activePlayer.devCards || []).filter(c => c === 'Victory Point').length;
+    const totalVP = activePlayer.victoryPoints + vpCards;
+    if (totalVP >= room.victoryPointsLimit) {
+      room.gameState = 'gameover';
+      room.winner = activePlayer.username;
+      room.gameLog.push(`${activePlayer.username} won the match by reaching ${room.victoryPointsLimit} Victory Points!`);
+    }
+
+    broadcastGameState(room);
+    socket.emit('sound', 'build');
+  });
+
+  // Buy a Development Card
+  socket.on('buyDevCard', () => {
+    const code = socket.roomCode;
+    const room = rooms[code];
+    if (!room) return;
+
+    const slotIndex = room.currentPlayerIndex;
+    const activePlayer = room.slots[slotIndex];
+
+    if (!activePlayer || activePlayer.id !== socket.id) {
+      socket.emit('errorMsg', 'It is not your turn.');
+      return;
+    }
+
+    if (room.gameState !== 'playing') {
+      socket.emit('errorMsg', 'Game is not in active playing phase.');
+      return;
+    }
+
+    if (!room.diceRolled) {
+      socket.emit('errorMsg', 'Must roll dice first.');
+      return;
+    }
+
+    const r = activePlayer.resources;
+    if (r.ore < 1 || r.wheat < 1 || r.sheep < 1) {
+      socket.emit('errorMsg', 'Insufficient resources to buy a Development Card. Requires 1 Ore, 1 Wheat, and 1 Sheep.');
+      return;
+    }
+
+    if (!room.devCardsDeck || room.devCardsDeck.length === 0) {
+      socket.emit('errorMsg', 'The Development Card deck is empty.');
+      return;
+    }
+
+    // Deduct resources
+    r.ore -= 1;
+    r.wheat -= 1;
+    r.sheep -= 1;
+    if (room.bank) {
+      room.bank.ore = Math.min(19, room.bank.ore + 1);
+      room.bank.wheat = Math.min(19, room.bank.wheat + 1);
+      room.bank.sheep = Math.min(19, room.bank.sheep + 1);
+    }
+
+    // Draw card
+    const cardDrawn = room.devCardsDeck.pop();
+    if (!activePlayer.devCards) {
+      activePlayer.devCards = [];
+    }
+    activePlayer.devCards.push(cardDrawn);
+
+    room.gameLog.push(`${activePlayer.username} bought a Development Card.`);
+
+    // Check win condition
+    const vpCards = (activePlayer.devCards || []).filter(c => c === 'Victory Point').length;
+    const totalVP = activePlayer.victoryPoints + vpCards;
+    if (totalVP >= room.victoryPointsLimit) {
+      room.gameState = 'gameover';
+      room.winner = activePlayer.username;
+      room.gameLog.push(`${activePlayer.username} won the match by reaching ${room.victoryPointsLimit} Victory Points!`);
+    }
+
+    broadcastGameState(room);
+    socket.emit('sound', 'build'); // Play the build chime
+  });
+
+  // Build Road
+  socket.on('buildRoad', (edgeId) => {
+    const code = socket.roomCode;
+    const room = rooms[code];
+    if (!room) return;
+
+    const slotIndex = room.currentPlayerIndex;
+    const activePlayer = room.slots[slotIndex];
+
+    if (!activePlayer || activePlayer.id !== socket.id) {
+      socket.emit('errorMsg', 'It is not your turn.');
+      return;
+    }
+
+    const edge = room.board.edges.find(e => e.id === edgeId);
+    if (!edge || edge.owner !== null) {
+      socket.emit('errorMsg', 'Invalid path.');
+      return;
+    }
+
+    if (room.gameState === 'setup') {
+      if (room.setupSubStep !== 'road') return;
+      if (edge.v1 !== room.lastSetupSettlement && edge.v2 !== room.lastSetupSettlement) {
+        socket.emit('errorMsg', 'Road must connect to your newly placed settlement.');
+        return;
+      }
+
+      edge.owner = activePlayer.index;
+      room.gameLog.push(`${activePlayer.username} placed a starting road.`);
+
+      const N = room.slots.length;
+      room.setupStep++;
+      room.setupSubStep = 'settlement';
+      room.lastSetupSettlement = null;
+
+      if (room.setupStep === 2 * N) {
+        room.gameState = 'playing';
+        room.currentPlayerIndex = 0;
+        room.diceRolled = false;
+        room.gameLog.push("Setup complete! Match starts. Roll the dice!");
+      } else {
+        let nextActiveIdx;
+        if (room.setupStep < N) {
+          nextActiveIdx = room.setupStep;
+        } else {
+          nextActiveIdx = 2 * N - 1 - room.setupStep;
+        }
+        room.currentPlayerIndex = nextActiveIdx;
+        const targetSlot = room.slots[nextActiveIdx];
+        room.gameLog.push(`It is now ${targetSlot.username}'s turn to place.`);
+      }
+
+      io.to(code).emit('gameState', getSanitizedRoomState(room));
+      socket.emit('sound', 'build');
+
+      // Run bot AI for setup if next slot is a bot
+      scheduleBotAction(code);
+
+    } else if (room.gameState === 'playing') {
+      if (!room.diceRolled) return;
+
+      const r = activePlayer.resources;
+      if (r.wood < 1 || r.brick < 1) {
+        socket.emit('errorMsg', 'Insufficient resources.');
+        return;
+      }
+
+      let connected = false;
+      if (room.board.vertices[edge.v1].owner === activePlayer.index || room.board.vertices[edge.v2].owner === activePlayer.index) {
+        connected = true;
+      }
+      if (!connected) {
+        for (let e of room.board.edges) {
+          if (e.id === edge.id) continue;
+          if (e.owner === activePlayer.index) {
+            if (e.v1 === edge.v1 || e.v1 === edge.v2 || e.v2 === edge.v1 || e.v2 === edge.v2) {
+              connected = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!connected) {
+        socket.emit('errorMsg', 'Road must connect to your structures.');
+        return;
+      }
+
+      r.wood--; r.brick--;
+      if (room.bank) {
+        room.bank.wood = Math.min(19, room.bank.wood + 1);
+        room.bank.brick = Math.min(19, room.bank.brick + 1);
+      }
+      edge.owner = activePlayer.index;
+      room.gameLog.push(`${activePlayer.username} built a road.`);
+
+      io.to(code).emit('gameState', getSanitizedRoomState(room));
+      socket.emit('sound', 'build');
+    }
+  });
+
+  // Roll dice
+  socket.on('rollDice', () => {
+    const code = socket.roomCode;
+    const room = rooms[code];
+    if (!room) return;
+
+    const slotIndex = room.currentPlayerIndex;
+    const activePlayer = room.slots[slotIndex];
+
+    if (!activePlayer || activePlayer.id !== socket.id) {
+      socket.emit('errorMsg', 'It is not your turn.');
+      return;
+    }
+
+    if (room.gameState !== 'playing' || room.diceRolled) return;
+
+    let d1, d2;
+    if (room.balancedDice) {
+      [d1, d2] = rollDiceBalanced(room);
+    } else {
+      d1 = Math.floor(Math.random() * 6) + 1;
+      d2 = Math.floor(Math.random() * 6) + 1;
+    }
+    const total = d1 + d2;
+    room.lastDiceRoll = [d1, d2];
+    room.diceRolled = true;
+    room.gameLog.push(`${activePlayer.username} rolled a ${total} (${d1} + ${d2}).`);
+
+    if (total !== 7) {
+      distributeResources(room, total);
+      io.to(code).emit('gameState', getSanitizedRoomState(room));
+      io.to(code).emit('sound', 'roll');
+      scheduleBotAction(code);
+    } else {
+      room.gameLog.push("A 7 was rolled! The Robber is activated.");
+      if (room.gameMode === 'heroknight') {
+        room.barbarianStep++;
+        room.gameLog.push(`Barbarians advanced! Threat level: ${room.barbarianStep}/7`);
+        if (room.barbarianStep === 7) {
+          triggerBarbarianAttack(room);
+        }
+      }
+
+      // Check if any player has strictly more than 7 cards
+      const discardsPending = {};
+      room.slots.forEach(slot => {
+        if (slot.type !== 'empty') {
+          const totalCards = Object.values(slot.resources).reduce((sum, count) => sum + count, 0);
+          if (totalCards > 7) {
+            discardsPending[slot.index] = Math.floor(totalCards / 2);
+          }
+        }
+      });
+      room.discardsPending = discardsPending;
+
+      // Handle Bot discards immediately on the server
+      room.slots.forEach(slot => {
+        if (slot.type !== 'empty' && slot.type.startsWith('bot') && room.discardsPending[slot.index]) {
+          const cardsToDiscard = room.discardsPending[slot.index];
+          let discardedCount = 0;
+          const resources = ['wood', 'brick', 'sheep', 'wheat', 'ore'];
+          while (discardedCount < cardsToDiscard) {
+            const available = resources.filter(res => slot.resources[res] > 0);
+            if (available.length === 0) break;
+            const chosen = available[Math.floor(Math.random() * available.length)];
+            slot.resources[chosen]--;
+            room.bank[chosen] = Math.min(19, room.bank[chosen] + 1);
+            discardedCount++;
+          }
+          room.gameLog.push(`${slot.username} discarded ${cardsToDiscard} cards.`);
+          delete room.discardsPending[slot.index];
+        }
+      });
+
+      if (Object.keys(room.discardsPending).length > 0) {
+        room.gameState = 'discard';
+      } else {
+        room.gameState = 'robberMove';
+      }
+
+      io.to(code).emit('gameState', getSanitizedRoomState(room));
+      io.to(code).emit('sound', 'roll');
+      scheduleBotAction(code);
+    }
+  });
+
+  // Train Knight (Hero & Knight mode)
+  socket.on('trainKnight', () => {
+    const code = socket.roomCode;
+    const room = rooms[code];
+    if (!room) return;
+
+    const slotIndex = room.currentPlayerIndex;
+    const activePlayer = room.slots[slotIndex];
+
+    if (!activePlayer || activePlayer.id !== socket.id) {
+      socket.emit('errorMsg', 'It is not your turn.');
+      return;
+    }
+
+    if (room.gameState !== 'playing' || !room.diceRolled) return;
+    if (room.gameMode !== 'heroknight') return;
+
+    const r = activePlayer.resources;
+    if (r.ore < 1 || r.sheep < 1) {
+      socket.emit('errorMsg', 'Insufficient resources (needs 1 Ore, 1 Sheep).');
+      return;
+    }
+
+    r.ore--;
+    r.sheep--;
+    if (room.bank) {
+      room.bank.ore = Math.min(19, room.bank.ore + 1);
+      room.bank.sheep = Math.min(19, room.bank.sheep + 1);
+    }
+    activePlayer.knights++;
+    room.gameLog.push(`${activePlayer.username} trained a Knight (Total Knight Power: ${activePlayer.knights}).`);
+
+    io.to(code).emit('gameState', getSanitizedRoomState(room));
+    socket.emit('sound', 'build');
+  });
+
+  // Bank Trade
+  socket.on('bankTrade', ({ offer, demand }) => {
+    const code = socket.roomCode;
+    const room = rooms[code];
+    if (!room) return;
+
+    const slotIndex = room.currentPlayerIndex;
+    const activePlayer = room.slots[slotIndex];
+
+    if (!activePlayer || activePlayer.id !== socket.id) {
+      socket.emit('errorMsg', 'It is not your turn.');
+      return;
+    }
+
+    if (room.gameState !== 'playing' || !room.diceRolled) return;
+
+    const resources = ['wood', 'brick', 'sheep', 'wheat', 'ore'];
+    if (!resources.includes(offer) || !resources.includes(demand)) return;
+    if (offer === demand) return;
+
+    if (activePlayer.resources[offer] < 4) {
+      socket.emit('errorMsg', `Insufficient resources.`);
+      return;
+    }
+
+    if (room.bank && room.bank[demand] < 1) {
+      socket.emit('errorMsg', `The Bank is out of ${demand} cards.`);
+      return;
+    }
+
+    activePlayer.resources[offer] -= 4;
+    activePlayer.resources[demand]++;
+    if (room.bank) {
+      room.bank[offer] = Math.min(19, room.bank[offer] + 4);
+      room.bank[demand]--;
+    }
+    room.gameLog.push(`${activePlayer.username} traded 4 ${offer} for 1 ${demand} with the Bank.`);
+
+    io.to(code).emit('gameState', getSanitizedRoomState(room));
+    socket.emit('sound', 'build');
+  });
+
+  // Submit Discards (Robber 7 phase)
+  socket.on('submitDiscard', (discardedCards) => {
+    const code = socket.roomCode;
+    const room = rooms[code];
+    if (!room) return;
+
+    if (room.gameState !== 'discard') return;
+
+    const slot = room.slots.find(s => s.id === socket.id);
+    if (!slot || !room.discardsPending[slot.index]) return;
+
+    const cardsToDiscard = room.discardsPending[slot.index];
+    let submittedTotal = 0;
+    for (let res of ['wood', 'brick', 'sheep', 'wheat', 'ore']) {
+      const amt = Number(discardedCards[res]) || 0;
+      if (amt < 0 || slot.resources[res] < amt) {
+        socket.emit('errorMsg', 'Invalid discard selection.');
+        return;
+      }
+      submittedTotal += amt;
+    }
+
+    if (submittedTotal !== cardsToDiscard) {
+      socket.emit('errorMsg', `Must discard exactly ${cardsToDiscard} cards.`);
+      return;
+    }
+
+    for (let res of ['wood', 'brick', 'sheep', 'wheat', 'ore']) {
+      const amt = Number(discardedCards[res]) || 0;
+      slot.resources[res] -= amt;
+      room.bank[res] = Math.min(19, room.bank[res] + amt);
+    }
+
+    room.gameLog.push(`${slot.username} discarded ${cardsToDiscard} cards.`);
+    delete room.discardsPending[slot.index];
+
+    if (Object.keys(room.discardsPending).length === 0) {
+      room.gameState = 'robberMove';
+    }
+
+    io.to(code).emit('gameState', getSanitizedRoomState(room));
+    
+    if (room.gameState === 'robberMove') {
+      scheduleBotAction(code);
+    }
+  });
+
+  // Move Robber
+  socket.on('moveRobber', ({ q, r }) => {
+    const code = socket.roomCode;
+    const room = rooms[code];
+    if (!room) return;
+
+    if (room.gameState !== 'robberMove') return;
+
+    const activePlayer = room.slots[room.currentPlayerIndex];
+    if (!activePlayer || activePlayer.id !== socket.id) {
+      socket.emit('errorMsg', 'It is not your turn.');
+      return;
+    }
+
+    const hex = room.board.hexes.find(h => h.q === q && h.r === r);
+    if (!hex || hex.resource === 'water') {
+      socket.emit('errorMsg', 'Must place the Robber on a land hex.');
+      return;
+    }
+
+    if (room.robberHex && room.robberHex.q === q && room.robberHex.r === r) {
+      socket.emit('errorMsg', 'Must move the Robber to a different hex.');
+      return;
+    }
+
+    room.robberHex = { q, r };
+    room.gameLog.push(`${activePlayer.username} moved the Robber.`);
+
+    room.gameState = 'playing';
+    room.diceRolled = true;
+
+    // Auto-steal
+    const adjacentPlayers = [];
+    hex.vertices.forEach(vId => {
+      const v = room.board.vertices[vId];
+      if (v && v.owner !== null && v.owner !== activePlayer.index) {
+        const ownerSlot = room.slots[v.owner];
+        if (ownerSlot && ownerSlot.type !== 'empty') {
+          const totalRes = Object.values(ownerSlot.resources).reduce((a, b) => a + b, 0);
+          if (totalRes > 0 && !adjacentPlayers.includes(ownerSlot.index)) {
+            adjacentPlayers.push(ownerSlot.index);
+          }
+        }
+      }
+    });
+
+    if (adjacentPlayers.length > 0) {
+      const targetIdx = adjacentPlayers[Math.floor(Math.random() * adjacentPlayers.length)];
+      const targetSlot = room.slots[targetIdx];
+      const resources = ['wood', 'brick', 'sheep', 'wheat', 'ore'];
+      const available = resources.filter(res => targetSlot.resources[res] > 0);
+      if (available.length > 0) {
+        const stolen = available[Math.floor(Math.random() * available.length)];
+        targetSlot.resources[stolen]--;
+        activePlayer.resources[stolen]++;
+        room.gameLog.push(`${activePlayer.username} stole 1 card from ${targetSlot.username}.`);
+      }
+    }
+
+    io.to(code).emit('gameState', getSanitizedRoomState(room));
+    scheduleBotAction(code);
+  });
+
+  // End Turn
+  socket.on('endTurn', () => {
+    const code = socket.roomCode;
+    const room = rooms[code];
+    if (!room) return;
+
+    const slotIndex = room.currentPlayerIndex;
+    const activePlayer = room.slots[slotIndex];
+
+    if (!activePlayer || activePlayer.id !== socket.id) {
+      socket.emit('errorMsg', 'It is not your turn.');
+      return;
+    }
+
+    if (room.gameState !== 'playing' || !room.diceRolled) return;
+
+    advanceTurn(room);
+    const nextPlayer = room.slots[room.currentPlayerIndex];
+    room.gameLog.push(`It is now ${nextPlayer.username}'s turn.`);
+
+    io.to(code).emit('gameState', getSanitizedRoomState(room));
+
+    // Schedule bots if next player is a bot
+    scheduleBotAction(code);
+  });
+
+  // Disconnect
+  socket.on('disconnect', () => {
+    const code = socket.roomCode;
+    const username = socket.username;
+    if (!code || !username) return;
+
+    const room = rooms[code];
+    if (!room) return;
+
+    const slot = room.slots.find(s => s.username === username);
+    if (slot) {
+      slot.disconnected = true;
+      room.gameLog.push(`${username} disconnected.`);
+
+      const activeCount = room.slots.filter(s => s.type === 'human' && !s.disconnected).length;
+      if (activeCount === 0) {
+        console.log(`Deleting empty room: ${code}`);
+        delete rooms[code];
+      } else {
+        io.to(code).emit('gameState', getSanitizedRoomState(room));
+      }
+    }
+  });
+});
+
+// Start the server
+server.listen(PORT, () => {
+  console.log(`Server listening on http://localhost:${PORT}`);
+});
