@@ -245,6 +245,23 @@ otp_expiry = 3600
 # admin_email = "admin@email.com"
 # sender_name = "Admin"
 
+# Vietnamese auth emails (also pushed to the hosted project; see docs/setup/supabase.md).
+[auth.email.template.confirmation]
+subject = "Xác nhận email của bạn · CatanDabuVerse"
+content_path = "./supabase/templates/confirmation.html"
+
+[auth.email.template.recovery]
+subject = "Đặt lại mật khẩu · CatanDabuVerse"
+content_path = "./supabase/templates/recovery.html"
+
+[auth.email.template.email_change]
+subject = "Xác nhận email mới · CatanDabuVerse"
+content_path = "./supabase/templates/email_change.html"
+
+[auth.email.template.magic_link]
+subject = "Đăng nhập CatanDabuVerse"
+content_path = "./supabase/templates/magic_link.html"
+
 # Uncomment to customize email template
 # [auth.email.template.invite]
 # subject = "You have been invited"

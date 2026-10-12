@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="vi">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Đăng nhập CatanDabuVerse</title></head>
+<body style="margin:0;padding:0;background:#f4f1ea;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#26303f;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f1ea;padding:24px 12px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#ffffff;border:1px solid #e4ddcf;border-radius:16px;">
+        <tr><td style="padding:28px 28px 8px;text-align:center;">
+          <div style="font-size:32px;line-height:1;">🎲</div>
+          <div style="font-size:20px;font-weight:800;margin-top:8px;">CatanDabuVerse</div>
+        </td></tr>
+        <tr><td style="padding:12px 28px 4px;">
+          <h1 style="font-size:18px;margin:0 0 10px;">Đăng nhập CatanDabuVerse</h1>
+          <p style="font-size:15px;line-height:1.55;margin:0 0 20px;color:#55617a;">Bấm nút dưới đây để đăng nhập vào tài khoản <b>{{ .Email }}</b>. Liên kết chỉ dùng được một lần.</p>
+        </td></tr>
+        <tr><td align="center" style="padding:0 28px 20px;">
+          <a href="{{ .ConfirmationURL }}" style="display:inline-block;background:#c9852b;color:#ffffff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 26px;border-radius:12px;">Đăng nhập</a>
+        </td></tr>
+        <tr><td style="padding:0 28px 24px;">
+          <p style="font-size:12px;line-height:1.5;margin:0 0 8px;color:#8b93a6;">Nút không bấm được? Mở liên kết này:<br><a href="{{ .ConfirmationURL }}" style="color:#7a4f12;word-break:break-all;">{{ .ConfirmationURL }}</a></p>
+          <p style="font-size:12px;line-height:1.5;margin:0;color:#8b93a6;">Nếu bạn không yêu cầu đăng nhập, cứ bỏ qua email này.</p>
+        </td></tr>
+      </table>
+      <p style="font-size:11px;color:#8b93a6;margin:14px 0 0;">Email tự động từ CatanDabuVerse, vui lòng không trả lời.</p>
+    </td></tr>
+  </table>
+</body>
+</html>
