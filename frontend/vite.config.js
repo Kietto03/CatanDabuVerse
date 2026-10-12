@@ -7,7 +7,8 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   build: {
     // Raise the warn limit slightly; the pixi chunk is inherently large but is
-    // now lazy-loaded (only pulled when a game board mounts, not on the lobby).
+    // now lazy-loaded (only pulled wh
+    // en a game board mounts, not on the lobby).
     chunkSizeWarningLimit: 700,
     rollupOptions: {
       output: {
@@ -17,6 +18,7 @@ export default defineConfig({
         manualChunks(id) {
           if (!id.includes('node_modules')) return;
           if (id.includes('pixi.js') || id.includes('@pixi')) return 'pixi';
+          if (id.includes('@supabase')) return 'supabase';
           if (id.includes('framer-motion') || id.includes('motion-dom') || id.includes('motion-utils')) return 'motion';
           if (
             id.includes('/react/') ||

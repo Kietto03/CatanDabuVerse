@@ -3,12 +3,16 @@ import { motion } from 'framer-motion';
 import { useGameStore } from '../store/gameStore';
 import { Button } from '../ui';
 
+// Lines of chat/log kept on screen (the server also sends only the recent tail).
+const VISIBLE_LOG = 150;
+
 function ChatWidget() {
   const gameState = useGameStore((state) => state.gameState);
   const socket = useGameStore((state) => state.socket);
   const [chatInput, setChatInput] = useState('');
   const isCollapsed = useGameStore((state) => state.chatCollapsed);
   const toggleChat = useGameStore((state) => state.toggleChat);
+  const replayMode = useGameStore((state) => state.replayMode);
   const logEndRef = useRef(null);
 
   useEffect(() => {
@@ -17,6 +21,8 @@ function ChatWidget() {
 
   if (!gameState) return null;
 
+  const visibleLog = gameState.gameLog.slice(-VISIBLE_LOG);
+  const logStart = (gameState.gameLogTotal ?? gameState.gameLog.length) - visibleLog.length;
   const mySlot = gameState.slots.find((s) => s.id === socket.id);
   const myUsername = mySlot ? mySlot.username : '';
 
@@ -45,7 +51,9 @@ function ChatWidget() {
       </div>
 
       <div className="flex-1 overflow-y-auto text-xs leading-relaxed flex flex-col gap-2.5 pr-1" style={{ color: 'var(--text)' }}>
-        {gameState.gameLog.map((log, index) => {
+        {/* Only the recent tail is rendered: rendering every line on every update got slower as games went on. */}
+        {visibleLog.map((log, i) => {
+          const index = logStart + i;   // absolute position in the full log: stable keys as the window slides
           const chatPrefix = '[CHAT] ';
           if (log.startsWith(chatPrefix)) {
             const content = log.substring(chatPrefix.length);
@@ -77,12 +85,12 @@ function ChatWidget() {
         <div ref={logEndRef} />
       </div>
 
-      <form onSubmit={handleSend} className="flex gap-2 pt-3 shrink-0" style={{ borderTop: '1px solid var(--border)' }}>
+      {!replayMode && <form onSubmit={handleSend} className="flex gap-2 pt-3 shrink-0" style={{ borderTop: '1px solid var(--border)' }}>
         <input type="text" placeholder="Nhắn tin…" value={chatInput} onChange={(e) => setChatInput(e.target.value)}
           className="focusable flex-1 px-3 py-2 text-xs font-bold"
           style={{ background: 'var(--surface-2)', border: '1px solid var(--border-strong)', borderRadius: 'var(--radius)', color: 'var(--text)' }} />
         <Button type="submit" variant="solid" tone="accent" size="sm" disabled={!chatInput.trim()}>Gửi</Button>
-      </form>
+      </form>}
     </motion.div>
   );
 }

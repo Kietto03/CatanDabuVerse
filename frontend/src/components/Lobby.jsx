@@ -3,6 +3,10 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { useGameStore } from '../store/gameStore';
 import { Button, Panel, Card, Badge } from '../ui';
 import MapPreview from './MapPreview';
+import { AccountButton } from './Auth';
+import MatchHistoryButton from './MatchHistory';
+import { useRoute } from '../store/routeStore';
+import { useAuthStore } from '../store/authStore';
 
 const SLOT_COLORS = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#eab308', '#06b6d4', '#ec4899'];
 
@@ -38,7 +42,14 @@ function Lobby() {
   const exitGame = useGameStore((state) => state.exitGame);
 
   const [activeTab, setActiveTab] = useState('join');
-  const [username, setUsername] = useState('');
+  const [typedName, setTypedName] = useState('');
+  // With login on, the seat name is the profile's display name (until the
+  // server keys seats by user id in roadmap step 3); otherwise it's typed in.
+  const authEnabled = useAuthStore((s) => s.enabled);
+  const profileName = useAuthStore((s) => s.profile?.display_name || '');
+  const isStaff = useAuthStore((s) => s.permissions.includes('monitor.view') || s.permissions.includes('report.resolve') || s.permissions.includes('*'));
+  const navigate = useRoute((s) => s.navigate);
+  const username = authEnabled ? profileName : typedName;
   const [roomCodeInput, setRoomCodeInput] = useState('');
   const [copied, setCopied] = useState(false);
 
@@ -202,8 +213,12 @@ function Lobby() {
             <span className="font-black text-lg leading-none">CATAN</span>
             <span className="text-[10px] font-bold" style={{ color: 'var(--muted)' }}>bản đầy đủ luật gốc</span>
           </div>
-          <input type="text" placeholder="Tên của bạn" value={username} onChange={(e) => setUsername(e.target.value)}
-            className="focusable px-4 py-2 font-bold w-full md:w-52 ml-2" style={inputStyle} />
+          {authEnabled ? (
+            <div className="ml-auto md:ml-2 flex items-center gap-2">{isStaff && <Button variant="soft" tone="info" size="sm" onClick={() => navigate('/admin')}>🛠 Quản trị</Button>}<MatchHistoryButton /><AccountButton /></div>
+          ) : (
+            <input type="text" placeholder="Tên của bạn" value={typedName} onChange={(e) => setTypedName(e.target.value)}
+              className="focusable px-4 py-2 font-bold w-full md:w-52 ml-2" style={inputStyle} />
+          )}
         </div>
         <div className="flex gap-1 p-1 rounded-xl" style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}>
           {['join', 'host'].map((t) => (

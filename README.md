@@ -57,6 +57,10 @@ Mở **http://localhost:3000** → nhập tên → *Tạo phòng* → chọn mod
 > Sau khi sửa frontend phải chạy lại `cd frontend && npm run build`.
 > Chạy ASGI qua `server:socket_app` (không phải `server:app`).
 
+**Đăng nhập + database (Supabase, tuỳ chọn):** chạy Supabase local (`npx supabase start`, cần Docker),
+rồi `cp .env.example .env` và `cp frontend/.env.example frontend/.env.local`, build lại frontend.
+Không có các file này thì game chạy như cũ (nhập tên, không lưu lịch sử). Chi tiết: [`docs/setup/supabase.md`](docs/setup/supabase.md).
+
 ---
 
 ## 🧱 Tech stack
@@ -87,10 +91,8 @@ frontend/
 requirements.txt
 ```
 
-**Tài liệu chi tiết:** [`PROGRESS.md`](PROGRESS.md) (tiến độ + changelog),
-[`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md),
-[`seafarers_cities_knights_plan.md`](seafarers_cities_knights_plan.md),
-[`FRONTEND_REVAMP_PLAN.md`](FRONTEND_REVAMP_PLAN.md).
+**Tài liệu chi tiết:** [`docs/`](docs/README.md) (kiến trúc, database, roadmap, cài đặt Supabase),
+[`PROGRESS.md`](PROGRESS.md) (tiến độ + changelog).
 
 ---
 

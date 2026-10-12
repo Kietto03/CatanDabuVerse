@@ -2,53 +2,94 @@ import os
 import math
 import random
 import secrets
-import sqlite3
 import asyncio
+import logging
+import signal
+
+from dotenv import load_dotenv
+load_dotenv()  # before importing db, which reads its settings from the environment
+
 import socketio
-from fastapi import FastAPI
+import gzip
+import uuid
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+import db
+from db import identity as db_identity, matches as db_matches, replays as db_replays, servers as db_servers
+from db.recovery import decode_room
 import map_layouts
 from bot_ai import bridge as _bot_bridge, mcts as _bot_mcts
 
-# Initialize SQLite database
-DB_FILE = "catan.db"
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            room_code TEXT,
-            winner TEXT,
-            victory_points INTEGER,
-            game_mode TEXT,
-            played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+# Seats are keyed by Supabase user id when login is required (SUPABASE_URL set),
+# otherwise by the typed username + a per-seat secret (legacy mode).
+AUTH_REQUIRED = db_identity.auth_required()
 
-def save_match(room_code, winner, victory_points, game_mode):
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO match_history (room_code, winner, victory_points, game_mode)
-            VALUES (?, ?, ?, ?)
-        """, (room_code, winner, victory_points, game_mode))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Error saving match history to SQLite: {e}")
 
-init_db()
+def _same_player(slot, uid, username):
+    if uid:
+        return slot.get('uid') == uid
+    return slot['username'] == username
+
+
+def _unique_seat_name(room, name, exclude_slot=None):
+    """Display names aren't unique across accounts; keep them unique inside a room
+    so the game log stays readable."""
+    taken = {s['username'] for s in room['slots'] if s is not exclude_slot and s['username']}
+    if name not in taken:
+        return name
+    n = 2
+    while f"{name} ({n})" in taken:
+        n += 1
+    return f"{name} ({n})"
 
 # Socket.IO & FastAPI setup
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 app = FastAPI()
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 socket_app = socketio.ASGIApp(sio, other_asgi_app=app)
+
+# Record which socket event (and seat) caused each state change, for replays.
+# Every @sio.on handler is wrapped; bot and timeout tasks tag themselves.
+_sio_on = sio.on
+
+
+def _seat_of(session):
+    room = rooms.get(session.get('room_code')) if session else None
+    if not room:
+        return None
+    slot = next((s for s in room['slots'] if _same_player(s, session.get('uid'), session.get('username'))), None)
+    return slot['index'] if slot else None
+
+
+def _recording_on(event, handler=None, namespace=None):
+    def register(fn):
+        async def wrapped(sid, *args):
+            try:
+                seat = _seat_of(await sio.get_session(sid))
+            except Exception:
+                seat = None
+            payload = args[0] if args and isinstance(args[0], (dict, list, str, int, float)) else None
+            if isinstance(payload, str):
+                payload = {'value': payload[:200]}
+            elif isinstance(payload, (int, float)):
+                payload = {'value': payload}
+            token = db_replays.current_action.set((event, seat, payload))
+            try:
+                return await fn(sid, *args)
+            finally:
+                db_replays.current_action.reset(token)
+        wrapped.__name__ = fn.__name__
+        _sio_on(event, namespace=namespace)(wrapped)
+        return fn
+    return register(handler) if handler else register
+
+
+sio.on = _recording_on
 
 # In-Memory Rooms Store
 rooms = {}
@@ -190,9 +231,15 @@ def roll_dice_balanced(room):
         d2 = val - d1
     return d1, d2
 
-def get_sanitized_room_state(room, recipient_socket_id=None):
+# Live updates carry only the recent log: the full log grows by ~1 KB per turn and
+# made every update (and the chat panel) slower as a game went on. Replays keep it all.
+LOG_TAIL = 150
+
+
+def get_sanitized_room_state(room, recipient_socket_id=None, full_log=False):
     return {
         'code': room['code'],
+        'matchId': room.get('matchId'),
         'gameState': room['gameState'],
         'gameMode': room['gameMode'],
         'hideBankCards': room['hideBankCards'],
@@ -207,7 +254,8 @@ def get_sanitized_room_state(room, recipient_socket_id=None):
         'lastDiceRoll': room['lastDiceRoll'],
         'board': room['board'],
         'winner': room['winner'],
-        'gameLog': room['gameLog'],
+        'gameLog': room['gameLog'] if full_log else room['gameLog'][-LOG_TAIL:],
+        'gameLogTotal': len(room['gameLog']),
         'slots': [
             {
                 'index': s['index'],
@@ -215,6 +263,7 @@ def get_sanitized_room_state(room, recipient_socket_id=None):
                 'color': s['color'],
                 'username': s['username'],
                 'id': s['id'],
+                'userId': s.get('uid'),          # account id (public profile id), for "report player"
                 'resources': s['resources'],
                 'victoryPoints': s['victoryPoints'],
                 'knights': s['knights'],
@@ -250,8 +299,27 @@ def get_sanitized_room_state(room, recipient_socket_id=None):
         'merchant': room.get('merchant')
     }
 
+def get_replay_state(room):
+    """State for replays: viewable only after the game, so every hand is revealed.
+    Socket ids become stable seat ids ('seat-0'…) so a viewer can watch "as" a seat;
+    deck order and seat secrets are never part of it."""
+    state = get_sanitized_room_state(room, None, full_log=True)
+    state.pop('gameLogTotal', None)
+    for out, s in zip(state['slots'], room['slots']):
+        out['id'] = f"seat-{s['index']}"
+        out.pop('userId', None)          # replays can be shared publicly: no account ids
+        out['devCards'] = list(s['devCards'])
+        out['devCardsBoughtThisTurn'] = list(s.get('devCardsBoughtThisTurn', []))
+        out['commodities'] = dict(s.get('commodities', {}))
+        out['progressCards'] = list(s.get('progressCards', []))
+        out['disconnected'] = False      # connection blips aren't part of the game
+    return state
+
+
 async def broadcast_game_state(room):
     room_code = room['code']
+    if room.get('_replay'):
+        db_replays.record(room, get_replay_state(room))
     for slot in room['slots']:
         if slot['type'] == 'human' and slot['id'] and not slot['disconnected']:
             state = get_sanitized_room_state(room, slot['id'])
@@ -808,7 +876,7 @@ def _bot_win_check(room, slot):
         room['gameState'] = 'gameover'
         room['winner'] = slot['username']
         room['gameLog'].append(f"{slot['username']} reaches {room['victoryPointsLimit']} Victory Points and wins!")
-        save_match(room['code'], slot['username'], slot['victoryPoints'], room['gameMode'])
+        db_matches.finish_match(room, slot)
 
 def do_bot_build_phase(room, slot):
     """Drive a bot's whole build phase: repeatedly take the best affordable
@@ -1075,6 +1143,7 @@ def schedule_bot_action(room_code):
     asyncio.create_task(run_bot_action(room_code))
 
 async def run_bot_action(room_code):
+    db_replays.current_action.set(('bot', None, None))
     await asyncio.sleep(1.2)
     room = rooms.get(room_code)
     if not room or room['gameState'] in ['lobby', 'gameover']:
@@ -1305,10 +1374,11 @@ async def get_session_room_and_slot(sid):
     if session:
         room_code = session.get('room_code')
         username = session.get('username')
+        uid = session.get('uid')
         if room_code:
             room = rooms.get(room_code)
             if room:
-                slot = next((s for s in room['slots'] if s['username'] == username), None)
+                slot = next((s for s in room['slots'] if _same_player(s, uid, username)), None)
                 if slot:
                     room['lastActionTime'] = time.time()
                     return room, slot
@@ -1319,7 +1389,9 @@ async def get_session_room_and_slot(sid):
             if slot.get('id') == sid:
                 # Re-save session for subsequent requests
                 try:
-                    await sio.save_session(sid, {'room_code': r_code, 'username': slot['username']})
+                    session = await sio.get_session(sid)
+                    session.update({'room_code': r_code, 'username': slot['username']})
+                    await sio.save_session(sid, session)
                 except Exception:
                     pass
                 room['lastActionTime'] = time.time()
@@ -1516,14 +1588,19 @@ def check_largest_army(room):
         room['largestArmyHolder'] = max_player_idx
 
 def check_victory(room, player):
+    # Once someone has won, later checks in the same action must not crown a
+    # second winner (this used to record the same game twice).
+    if room['gameState'] == 'gameover':
+        return False
     vp_cards = player['devCards'].count('Victory Point') + player.get('devCardsBoughtThisTurn', []).count('Victory Point')
     total_vp = player['victoryPoints'] + vp_cards
     if total_vp >= room['victoryPointsLimit']:
         room['gameState'] = 'gameover'
         room['winner'] = player['username']
         player['victoryPoints'] = total_vp
+        player['vpCardsCounted'] = True
         room['gameLog'].append(f"{player['username']} wins the match by reaching {total_vp} Victory Points (including {vp_cards} Victory Point cards)!")
-        save_match(room['code'], player['username'], total_vp, room['gameMode'])
+        db_matches.finish_match(room, player)
         return True
     return False
 
@@ -1571,37 +1648,94 @@ def award_metropolis(room, slot, track):
     room['gameLog'].append(f"{slot['username']} built the {track.capitalize()} Metropolis (+2 Victory Points)!")
     check_victory(room, slot)
 
+EMPTY_ROOM_GRACE_SECONDS = float(os.environ.get("EMPTY_ROOM_GRACE_SECONDS", 60))
+_socket_count = 0
+
+
+def _connected_humans(room):
+    return len([s for s in room['slots'] if s['type'] == 'human' and not s['disconnected']])
+
+
+async def _delete_if_still_empty(room_code, grace=None):
+    await asyncio.sleep(EMPTY_ROOM_GRACE_SECONDS if grace is None else grace)
+    room = rooms.get(room_code)
+    if room and _connected_humans(room) == 0:
+        print(f"Deleting empty room: {room_code}")
+        rooms.pop(room_code, None)
+        db_replays.flush(room)
+        if room['gameState'] != 'gameover':
+            db_matches.abandon_match(room, 'all_left')
+        db.forget_match(room.get('matchId'))
+
+
 # Socket Event Handlers
 @sio.event
-async def connect(sid, environ):
-    print(f"Socket connected: {sid}")
+async def connect(sid, environ, auth=None):
+    """Authenticate the socket. With login required, the Supabase access token in
+    `auth.token` is verified and the account becomes the socket's identity."""
+    session = {}
+    if AUTH_REQUIRED:
+        token = (auth or {}).get('token')
+        try:
+            claims = await db_identity.verify_token(token)
+        except db_identity.AuthError as e:
+            print(f"Socket {sid} rejected: {e}")
+            raise socketio.exceptions.ConnectionRefusedError('unauthorized')
+        uid = claims['sub']
+        ban = await db_identity.active_sanction(uid, 'ban')
+        if ban:
+            until = ban['expires_at'].strftime('%Y-%m-%d %H:%M UTC') if ban['expires_at'] else None
+            raise socketio.exceptions.ConnectionRefusedError('banned', {'reason': ban['reason'], 'until': until})
+        profile = await db_identity.load_profile(uid)
+        meta = claims.get('user_metadata') or {}
+        session = {
+            'uid': uid,
+            'display_name': (profile and profile['display_name']) or meta.get('name') or 'Player',
+            'is_guest': bool(claims.get('is_anonymous')),
+            'permissions': claims.get('app_permissions') or [],
+        }
+        session['conn_id'] = await db_matches.open_connection(
+            uid, sid,
+            db_identity.hash_ip(environ.get('HTTP_X_FORWARDED_FOR', '').split(',')[0].strip() or environ.get('REMOTE_ADDR')),
+            environ.get('HTTP_USER_AGENT'))
+    await sio.save_session(sid, session)
+    global _socket_count
+    _socket_count += 1
+    print(f"Socket connected: {sid} {session.get('uid', '')}")
 
 @sio.event
-async def disconnect(sid):
+async def disconnect(sid, reason=None):
+    global _socket_count
+    _socket_count = max(0, _socket_count - 1)
     session = await sio.get_session(sid)
     if session:
+        await db_matches.close_connection(session.get('conn_id'), str(reason) if reason else None)
         room_code = session.get('room_code')
         username = session.get('username')
         if room_code and username:
             room = rooms.get(room_code)
             if room:
-                slot = next((s for s in room['slots'] if s['username'] == username), None)
-                if slot:
+                slot = next((s for s in room['slots'] if _same_player(s, session.get('uid'), username)), None)
+                # A newer tab of the same account may own the seat now; only that socket's
+                # disconnect counts.
+                if slot and slot.get('id') == sid:
                     slot['disconnected'] = True
-                    room['gameLog'].append(f"{username} disconnected.")
+                    room['gameLog'].append(f"{slot['username']} disconnected.")
 
-                    active_count = len([s for s in room['slots'] if s['type'] == 'human' and not s['disconnected']])
-                    if active_count == 0:
-                         print(f"Deleting empty room: {room_code}")
-                         rooms.pop(room_code, None)
+                    if _connected_humans(room) == 0:
+                        # Keep the room briefly so a page reload / network blip can rejoin.
+                        asyncio.create_task(_delete_if_still_empty(room_code))
                     else:
-                         await broadcast_game_state(room)
+                        await broadcast_game_state(room)
 
 @sio.on('createRoom')
 async def on_create_room(sid, data):
     import time
     code = data['roomCode'].strip().upper()
-    username = data['username'].strip()
+    session = await sio.get_session(sid)
+    uid = session.get('uid')
+    # With login, the seat name comes from the verified profile, not the client.
+    username = session['display_name'] if uid else data['username'].strip()
     print(f"[DEBUG] on_create_room: sid={sid}, code={code}, username={username}")
 
     if not code or not username:
@@ -1644,7 +1778,9 @@ async def on_create_room(sid, data):
             'knightsPlayed': 0,
             'devCardPlayedThisTurn': False,
             'disconnected': False,
-            'secret': secrets.token_hex(16) if s_id else None,
+            'uid': uid if s_id else None,
+            # Legacy (no-login) seat proof for reconnects; accounts don't need it.
+            'secret': secrets.token_hex(16) if (s_id and not uid) else None,
             'ready': True if (idx == 0 and s['type'] == 'human') else False,
             # Cities & Knights state
             'commodities': { 'coin': 0, 'cloth': 0, 'paper': 0 },
@@ -1702,8 +1838,15 @@ async def on_create_room(sid, data):
         'forcedDice': None
     }
 
+    try:
+        room['matchId'] = await db_matches.create_match(room, uid)
+    except db_matches.RoomCodeTaken:
+        await sio.emit('errorMsg', 'Room code is already active.', to=sid)
+        return
     rooms[code] = room
-    await sio.save_session(sid, {'room_code': code, 'username': username})
+    session.update({'room_code': code, 'username': username})
+    await sio.save_session(sid, session)
+    await db_matches.attach_connection(session.get('conn_id'), room['matchId'])
     await sio.enter_room(sid, code)
     host_slot = room['slots'][0]
     if host_slot.get('secret'):
@@ -1713,7 +1856,9 @@ async def on_create_room(sid, data):
 @sio.on('joinRoom')
 async def on_join_room(sid, data):
     code = data['roomCode'].strip().upper()
-    username = data['username'].strip()
+    session = await sio.get_session(sid)
+    uid = session.get('uid')
+    username = session['display_name'] if uid else data['username'].strip()
     print(f"[DEBUG] on_join_room: sid={sid}, code={code}, username={username}")
 
     if not code or not username:
@@ -1727,23 +1872,27 @@ async def on_join_room(sid, data):
 
     # Reconnect check
     provided_token = data.get('token')
-    existing_slot = next((s for s in room['slots'] if s['username'] == username and s['type'] == 'human'), None)
+    existing_slot = next((s for s in room['slots'] if s['type'] == 'human' and s['username'] is not None
+                          and _same_player(s, uid, username)), None)
     if existing_slot:
-        # A slot that already has a secret can only be reclaimed with the matching
-        # token. This prevents anyone who knows the room code + a player's name from
-        # hijacking their seat and reading their private dev cards.
-        if existing_slot.get('secret') and existing_slot['secret'] != provided_token:
+        # Legacy mode: a slot that already has a secret can only be reclaimed with the
+        # matching token, so knowing the room code + a name can't hijack a seat.
+        # With accounts the verified user id already proves ownership.
+        if not uid and existing_slot.get('secret') and existing_slot['secret'] != provided_token:
             await sio.emit('errorMsg', 'That name is already taken in this room.', to=sid)
             return
         import time
         existing_slot['id'] = sid
         existing_slot['disconnected'] = False
-        if not existing_slot.get('secret'):
-            existing_slot['secret'] = secrets.token_hex(16)
-        await sio.save_session(sid, {'room_code': code, 'username': username})
+        session.update({'room_code': code, 'username': existing_slot['username']})
+        await sio.save_session(sid, session)
+        await db_matches.attach_connection(session.get('conn_id'), room.get('matchId'))
         await sio.enter_room(sid, code)
-        await sio.emit('session', {'token': existing_slot['secret']}, to=sid)
-        room['gameLog'].append(f"{username} reconnected.")
+        if not uid:
+            if not existing_slot.get('secret'):
+                existing_slot['secret'] = secrets.token_hex(16)
+            await sio.emit('session', {'token': existing_slot['secret']}, to=sid)
+        room['gameLog'].append(f"{existing_slot['username']} reconnected.")
         room['lastActionTime'] = time.time()
         await broadcast_game_state(room)
         return
@@ -1758,17 +1907,22 @@ async def on_join_room(sid, data):
         return
 
     import time
+    username = _unique_seat_name(room, username)
     open_slot['id'] = sid
     open_slot['username'] = username
+    open_slot['uid'] = uid
     open_slot['disconnected'] = False
     open_slot['ready'] = False
-    open_slot['secret'] = secrets.token_hex(16)
+    open_slot['secret'] = None if uid else secrets.token_hex(16)
     room['gameLog'].append(f"{username} joined the room.")
     room['lastActionTime'] = time.time()
 
-    await sio.save_session(sid, {'room_code': code, 'username': username})
+    session.update({'room_code': code, 'username': username})
+    await sio.save_session(sid, session)
+    await db_matches.attach_connection(session.get('conn_id'), room.get('matchId'))
     await sio.enter_room(sid, code)
-    await sio.emit('session', {'token': open_slot['secret']}, to=sid)
+    if not uid:
+        await sio.emit('session', {'token': open_slot['secret']}, to=sid)
     await broadcast_game_state(room)
 
 @sio.on('startGame')
@@ -1824,6 +1978,8 @@ async def on_start_game(sid):
     room['setupSubStep'] = 'settlement'
     room['currentPlayerIndex'] = 0
 
+    db_matches.start_match(room)
+    db_replays.start(room, get_replay_state(room))
     room['gameLog'].append('The game has started! Player order has been randomized.')
     order_names = " -> ".join(s['username'] for s in room['slots'])
     room['gameLog'].append(f"Player Order: {order_names}")
@@ -1926,7 +2082,7 @@ async def on_build_settlement(sid, raw_vertex_id):
             room['gameState'] = 'gameover'
             room['winner'] = active_player['username']
             room['gameLog'].append(f"{active_player['username']} won the match by reaching {room['victoryPointsLimit']} Victory Points!")
-            save_match(room['code'], active_player['username'], active_player['victoryPoints'], room['gameMode'])
+            db_matches.finish_match(room, active_player)
 
         check_longest_road(room)
         check_road_victory(room)
@@ -1978,7 +2134,7 @@ async def on_build_city(sid, raw_vertex_id):
         room['gameState'] = 'gameover'
         room['winner'] = active_player['username']
         room['gameLog'].append(f"{active_player['username']} won the match by reaching {room['victoryPointsLimit']} Victory Points!")
-        save_match(room['code'], active_player['username'], active_player['victoryPoints'], room['gameMode'])
+        db_matches.finish_match(room, active_player)
 
     await broadcast_game_state(room)
     await sio.emit('sound', 'build', to=sid)
@@ -3415,6 +3571,7 @@ def schedule_bot_trade_responses(room_code):
     asyncio.create_task(run_bot_trade_responses(room_code))
 
 async def run_bot_trade_responses(room_code):
+    db_replays.current_action.set(('bot', None, None))
     await asyncio.sleep(1.0)
     room = rooms.get(room_code)
     if not room or not room.get('activeTrade') or room['gameState'] in ['lobby', 'gameover']:
@@ -3619,10 +3776,14 @@ async def on_chat_message(sid, text):
     room, slot = await get_session_room_and_slot(sid)
     if not room or not slot:
         return
-    text = text.strip()
+    text = text.strip()[:500]
     if not text:
         return
+    if slot.get('uid') and await db_identity.active_sanction(slot['uid'], 'mute'):
+        await sio.emit('errorMsg', 'You are muted and cannot chat right now.', to=sid)
+        return
     room['gameLog'].append(f"[CHAT] {slot['username']}: {text}")
+    db_matches.log_chat(room, slot, text)
     room['lastActionTime'] = time.time()
     await broadcast_game_state(room)
 
@@ -3680,6 +3841,7 @@ async def on_switch_slot(sid, target_idx):
         id_val = slot['id']
         ready_val = slot.get('ready', False)
         secret_val = slot.get('secret')
+        uid_val = slot.get('uid')
 
         # Clear current slot
         room['slots'][curr_idx]['type'] = target_type
@@ -3687,6 +3849,7 @@ async def on_switch_slot(sid, target_idx):
         room['slots'][curr_idx]['id'] = None
         room['slots'][curr_idx]['ready'] = False
         room['slots'][curr_idx]['secret'] = None
+        room['slots'][curr_idx]['uid'] = None
 
         # Fill target slot
         target_slot['type'] = 'human'
@@ -3694,6 +3857,7 @@ async def on_switch_slot(sid, target_idx):
         target_slot['id'] = id_val
         target_slot['ready'] = ready_val
         target_slot['secret'] = secret_val
+        target_slot['uid'] = uid_val
         
         room['lastActionTime'] = time.time()
         await broadcast_game_state(room)
@@ -3829,6 +3993,7 @@ def auto_setup_placement(room):
 
 
 async def room_timeout_monitor():
+    db_replays.current_action.set(('timeout', None, None))
     while True:
         try:
             await asyncio.sleep(1)
@@ -3939,9 +4104,138 @@ async def room_timeout_monitor():
             print(f"Error in room_timeout_monitor: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Multi-server: registry, heartbeat, failover, graceful handover
+# ---------------------------------------------------------------------------
+PORT = int(os.environ.get("PORT", 3000))
+PUBLIC_URL = (os.environ.get("PUBLIC_URL") or f"http://localhost:{PORT}").rstrip('/')
+HEARTBEAT_SECONDS = float(os.environ.get("HEARTBEAT_SECONDS", 15))
+FAILOVER_INTERVAL_SECONDS = float(os.environ.get("FAILOVER_INTERVAL_SECONDS", 30))
+EXIT_WHEN_DRAINED = os.environ.get("EXIT_WHEN_DRAINED") == "1"
+_server_status = 'active'
+
+
+async def restore_match(match_id):
+    """Rebuild a match taken over from a dead server from its last checkpoint."""
+    import json, time
+    cp = await db_servers.load_checkpoint(match_id)
+    if not cp:
+        await db_servers.abandon(match_id, 'server_lost')
+        print(f"[failover] {match_id}: no checkpoint, abandoned")
+        return
+    room = decode_room(json.loads(cp['room']))
+    code = room['code']
+    if code in rooms:
+        print(f"[failover] {match_id}: room code {code} already live here, skipped")
+        return
+    for s in room['slots']:
+        if s['type'] == 'human':
+            s['id'] = None
+            s['disconnected'] = True
+    room['matchId'] = match_id
+    room['lastActionTime'] = time.time()
+    rooms[code] = room
+    try:
+        recorded = await db_replays.recorded_state(match_id, cp['seq'])
+    except Exception as e:
+        print(f"[failover] {match_id}: could not rebuild recorded state ({e}); continuing from checkpoint")
+        recorded = None
+    db_replays.resume(room, recorded or get_replay_state(room), cp['seq'], cp['turn_no'])
+    room['gameLog'].append("Server failure: the game was restored on another server. Waiting for players to reconnect…")
+    await broadcast_game_state(room)
+    schedule_bot_action(code)
+    # Players need time to notice and reconnect; drop the room if nobody returns.
+    asyncio.create_task(_delete_if_still_empty(code, grace=max(EMPTY_ROOM_GRACE_SECONDS, 120)))
+    print(f"[failover] restored {code} ({match_id}) at event {cp['seq']}")
+
+
+async def _lost_ownership():
+    """Another server declared us dead and took our matches: stop running them."""
+    print(f"[failover] this server was declared dead; dropping {len(rooms)} room(s) and re-registering")
+    for code, room in list(rooms.items()):
+        room.pop('_replay', None)
+        room['finalized'] = True          # never write results for a match we no longer own
+        for s in room['slots']:
+            if s.get('id'):
+                await sio.emit('errorMsg', 'Connection moved to another server, reconnecting…', to=s['id'])
+                await sio.disconnect(s['id'])
+        rooms.pop(code, None)
+    await db_servers.register(PUBLIC_URL)
+
+
+async def close_terminated_rooms():
+    """Admins end matches in the database; the owning server closes the room."""
+    live = {r['matchId']: code for code, r in rooms.items() if r.get('matchId')}
+    for match_id in await db_servers.terminated_among(list(live)):
+        code = live[match_id]
+        room = rooms.pop(code, None)
+        if not room:
+            continue
+        room['finalized'] = True
+        room.pop('_replay', None)
+        for s in room['slots']:
+            if s.get('id') and not s.get('disconnected'):
+                await sio.emit('roomClosed', {'reason': 'Ván đấu đã bị quản trị viên kết thúc.'}, to=s['id'])
+        db.forget_match(match_id)
+        print(f"[admin] closed terminated room {code} ({match_id})")
+
+
+async def heartbeat_loop():
+    global _server_status
+    while True:
+        try:
+            await close_terminated_rooms()
+            status = await db_servers.heartbeat(len(rooms), _socket_count)
+            if status == 'dead':
+                await _lost_ownership()
+            elif status:
+                _server_status = status
+                if status == 'draining' and EXIT_WHEN_DRAINED and not rooms:
+                    print("[server] drained, exiting")
+                    os.kill(os.getpid(), signal.SIGTERM)
+        except Exception as e:
+            print(f"[heartbeat] {e}")
+        await asyncio.sleep(HEARTBEAT_SECONDS)
+
+
+async def failover_loop():
+    await asyncio.sleep(random.uniform(1, 5))     # spread servers out
+    while True:
+        try:
+            if _server_status == 'active':
+                for match_id in await db_servers.claim_orphans():
+                    await restore_match(match_id)
+        except Exception as e:
+            print(f"[failover] {e}")
+        await asyncio.sleep(FAILOVER_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
 async def startup_event():
+    await db.init()
+    await db_matches.abandon_orphans_on_boot()
+    await db_replays.load_config()
+    if await db_servers.register(PUBLIC_URL):
+        print(f"Registered game server {db_servers.server_id} at {PUBLIC_URL}")
+        asyncio.create_task(heartbeat_loop())
+        asyncio.create_task(failover_loop())
+    if AUTH_REQUIRED:
+        print("Login required: sockets must present a Supabase access token.")
     asyncio.create_task(room_timeout_monitor())
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    # Graceful handover: checkpoint every live game, then mark this server dead
+    # so another server takes the games over at its next failover tick.
+    for room in list(rooms.values()):
+        if room.get('_replay'):
+            db_replays.record(room, get_replay_state(room))   # capture changes not yet broadcast
+        db_replays.checkpoint_now(room)
+    await db.wait_pending()
+    await db_servers.set_status('dead')
+    print(f"[server] shutdown: handed over {len(rooms)} room(s)")
+    await db.close()
 
 
 @app.get("/api/maps")
@@ -3950,6 +4244,68 @@ async def api_maps():
     preview the maps available in each mode. Registered before the static mount
     so it isn't swallowed by the catch-all."""
     return {'maps': map_layouts.all_maps_meta()}
+
+
+def _bearer(request):
+    auth = request.headers.get('authorization', '')
+    return auth[7:] if auth.lower().startswith('bearer ') else None
+
+
+async def _replay_for_request(request, match_id):
+    """Participants of the match (or holders of match.view_any) get its replay."""
+    if not db.enabled():
+        raise HTTPException(503, 'Replays are not available on this server.')
+    try:
+        claims = await db_identity.verify_token(_bearer(request))
+    except db_identity.AuthError:
+        raise HTTPException(401, 'Sign in to download replays.')
+    try:
+        uuid.UUID(match_id)
+    except ValueError:
+        raise HTTPException(404, 'Replay not found.')
+    perms = claims.get('app_permissions') or []
+    row = await db.fetchrow(
+        """select m.room_code, m.status, m.replay_purged_at,
+                  exists (select 1 from public.match_participants p
+                          where p.match_id = m.id and p.user_id = $2::uuid) as participant
+           from public.matches m where m.id = $1::uuid""", match_id, claims['sub'])
+    if not row or not (row['participant'] or 'match.view_any' in perms or '*' in perms):
+        raise HTTPException(404, 'Replay not found.')
+    if row['status'] != 'finished':
+        raise HTTPException(409, 'This match has no replay (it did not finish).')
+    if row['replay_purged_at']:
+        raise HTTPException(410, 'This replay has expired.')
+    rep_row = await db.fetchrow('select public.build_replay($1::uuid) as r', match_id)
+    if not rep_row or not rep_row['r']:
+        raise HTTPException(410, 'This replay has expired.')
+    return claims, row, rep_row['r']
+
+
+@app.get("/api/replays/{match_id}")
+async def api_replay(match_id: str, request: Request):
+    _, _, replay = await _replay_for_request(request, match_id)
+    return Response(replay, media_type='application/json')
+
+
+@app.get("/api/replays/{match_id}/export")
+async def api_replay_export(match_id: str, request: Request):
+    claims, row, replay = await _replay_for_request(request, match_id)
+    data = gzip.compress(replay.encode(), compresslevel=9)
+    await db.fetchrow(
+        """insert into public.replay_exports (match_id, user_id, format_version, size_bytes)
+           values ($1::uuid, $2::uuid, 1, $3) returning id""", match_id, claims['sub'], len(data))
+    name = f"catan-{row['room_code']}-{match_id[:8]}.catanreplay"
+    return Response(data, media_type='application/gzip',
+                    headers={'Content-Disposition': f'attachment; filename="{name}"'})
+
+
+# Client-side routes (replay viewer, share links, admin site) load the SPA.
+@app.get("/admin")
+@app.get("/admin/{rest:path}")
+@app.get("/replay/{rest:path}")
+@app.get("/r/{rest:path}")
+async def spa_routes(rest: str = ''):
+    return FileResponse("frontend/dist/index.html")
 
 
 # Serve static frontend files from compiled React build folder
