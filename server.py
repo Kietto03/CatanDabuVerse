@@ -4108,7 +4108,9 @@ async def room_timeout_monitor():
 # Multi-server: registry, heartbeat, failover, graceful handover
 # ---------------------------------------------------------------------------
 PORT = int(os.environ.get("PORT", 3000))
-PUBLIC_URL = (os.environ.get("PUBLIC_URL") or f"http://localhost:{PORT}").rstrip('/')
+# Render sets RENDER_EXTERNAL_URL (e.g. https://<service>.onrender.com) automatically.
+PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+              or f"http://localhost:{PORT}").rstrip('/')
 HEARTBEAT_SECONDS = float(os.environ.get("HEARTBEAT_SECONDS", 15))
 FAILOVER_INTERVAL_SECONDS = float(os.environ.get("FAILOVER_INTERVAL_SECONDS", 30))
 EXIT_WHEN_DRAINED = os.environ.get("EXIT_WHEN_DRAINED") == "1"
@@ -4249,6 +4251,17 @@ async def shutdown_event():
     await db_servers.set_status('dead')
     print(f"[server] shutdown: handed over {len(rooms)} room(s)")
     await db.close()
+
+
+@app.get("/api/health")
+async def api_health():
+    """Liveness + which commit is running (the deploy pipeline waits for its own commit)."""
+    return {
+        'ok': True,
+        'commit': os.environ.get('RENDER_GIT_COMMIT') or os.environ.get('GIT_COMMIT'),
+        'database': db.enabled(),
+        'rooms': len(rooms),
+    }
 
 
 @app.get("/api/maps")
