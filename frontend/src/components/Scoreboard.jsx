@@ -2,11 +2,13 @@ import React from 'react';
 import { motion } from 'framer-motion';
 import { useGameStore } from '../store/gameStore';
 import { Button, Badge } from '../ui';
+import ReportPlayerButton from './ReportPlayer';
 
 function Scoreboard() {
   const gameState = useGameStore((state) => state.gameState);
   const socket = useGameStore((state) => state.socket);
   const exitGame = useGameStore((state) => state.exitGame);
+  const replayMode = useGameStore((state) => state.replayMode);
 
   if (!gameState) return null;
 
@@ -35,7 +37,7 @@ function Scoreboard() {
           CATAN
         </span>
         <Badge tone="accent" style={{ fontSize: 11 }}>ROOM {gameState.code}</Badge>
-        <Button variant="soft" tone="danger" size="sm" onClick={exitGame}>Rời 🚪</Button>
+        {!replayMode && <Button variant="soft" tone="danger" size="sm" onClick={exitGame}>Rời 🚪</Button>}
 
         <div className="hidden md:flex flex-col text-left pl-2.5" style={{ borderLeft: '1px solid var(--border)' }}>
           <span className="font-black text-xs" style={{ color: activePlayer?.color || 'var(--text)' }}>
@@ -97,6 +99,7 @@ function Scoreboard() {
                   {slot.username}{isMe && ' (Bạn)'}
                 </span>
                 {slot.disconnected && <Badge tone="danger" style={{ fontSize: 8, padding: '1px 5px' }}>DC</Badge>}
+                {!isMe && !replayMode && slot.type === 'human' && <ReportPlayerButton slot={slot} matchId={gameState.matchId} />}
               </div>
 
               <div className="grid grid-cols-3 gap-1 text-[10px] font-bold" style={{ color: 'var(--text-2)' }}>

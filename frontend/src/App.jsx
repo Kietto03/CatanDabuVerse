@@ -8,6 +8,13 @@ import ChatWidget from './components/ChatWidget';
 import LeftNavBar from './components/LeftNavBar';
 import ExpansionPanel from './components/ExpansionPanel';
 import Celebration from './components/Celebration';
+import { AuthScreen, AuthLoading, NewPasswordModal } from './components/Auth';
+import { useAuthStore } from './store/authStore';
+import { useRoute, parseRoute } from './store/routeStore';
+import ReplayViewer from './components/ReplayViewer';
+
+// The admin site is its own chunk: players never download it.
+const AdminApp = lazy(() => import('./admin/AdminApp'));
 
 // PixiJS (~big) is only needed once a game board is on screen. Lazy-loading it
 // keeps the pixi chunk out of the initial lobby download.
@@ -45,8 +52,16 @@ function App() {
   const gameState = useGameStore((state) => state.gameState);
   const toastMsg = useGameStore((state) => state.toastMsg);
   const connected = useGameStore((state) => state.connected);
+  const authEnabled = useAuthStore((s) => s.enabled);
+  const authReady = useAuthStore((s) => s.ready);
+  const session = useAuthStore((s) => s.session);
 
   const inGame = gameState && gameState.gameState !== 'lobby';
+  const needsLogin = authEnabled && !session;
+  const path = useRoute((s) => s.path);
+  const replayRoute = parseRoute(path);
+  // Share links and replay files work without an account; my-match replays need one.
+  const replayNeedsLogin = (replayRoute?.kind === 'match' || replayRoute?.kind === 'admin') && needsLogin;
 
   return (
     <MotionConfig reducedMotion="user">
@@ -61,10 +76,20 @@ function App() {
         )}
 
         {/* Connection lost overlay (socket dropped / reconnecting) */}
-        {!connected && <ReconnectOverlay />}
+        {!connected && !needsLogin && !replayRoute && <ReconnectOverlay />}
+
+        <NewPasswordModal />
 
         {/* Screen Router */}
-        {!inGame ? (
+        {!authReady ? (
+          <AuthLoading />
+        ) : replayRoute?.kind === 'admin' && !replayNeedsLogin ? (
+          <Suspense fallback={<AuthLoading />}><AdminApp tab={replayRoute.tab} /></Suspense>
+        ) : replayRoute && !replayNeedsLogin ? (
+          <ReplayViewer key={path} route={replayRoute} />
+        ) : needsLogin ? (
+          <AuthScreen />
+        ) : !inGame ? (
           <Lobby />
         ) : (
           <div className="relative h-screen w-screen overflow-hidden select-none">

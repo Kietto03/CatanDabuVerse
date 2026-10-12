@@ -3,6 +3,7 @@
    Thay style neo-brutalist inline lặp lại. Có framer-motion.
    ============================================================ */
 import React from 'react';
+import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const TONE = {
@@ -96,8 +97,10 @@ export function Badge({ tone = 'neutral', className = '', style = {}, children }
   );
 }
 
+// Rendered into <body>: an ancestor with transform / filter / backdrop-filter
+// (e.g. the blurred top bar) would otherwise trap a position:fixed overlay.
 export function Modal({ open, onClose, title, maxWidth = 440, children }) {
-  return (
+  return createPortal((
     <AnimatePresence>
       {open && (
         <motion.div
@@ -130,7 +133,7 @@ export function Modal({ open, onClose, title, maxWidth = 440, children }) {
         </motion.div>
       )}
     </AnimatePresence>
-  );
+  ), document.body);
 }
 
 /* Màu người chơi theo tên slot color của backend */
