@@ -70,7 +70,10 @@ Status legend: ✅ done · 🔄 in progress · ⬜ not started
 - ✅ `Dockerfile` (web build + Python 3.13 server, non-root) and `.dockerignore`; image verified locally against the hosted project (DB, registration, hosted login over Socket.IO)
 - ✅ `fly.toml`: `sin`, always-on single machine, health check, rolling deploys with game handover
 - ✅ Frontend lint is now a real gate: 29 old errors fixed (unused imports and variables, empty catches); three advisory React-compiler rules downgraded to warnings
-- ⬜ Fly account + app + secrets, GitHub secrets, first deploy
+- ✅ Fly app `catandabuverse` (sin) with secrets, public IPs (shared v4 + v6), deploy token in GitHub; Supabase site URL + redirect allow-list set to `https://catandabuverse.fly.dev`
+- ✅ First production deploy through GitHub (merge of PR #2): migrations step, Fly deploy and the live site all work. Verified in a browser on https://catandabuverse.fly.dev (guest sign-in, WebSocket, game start); test data removed
+- ✅ Fixed: a dev server pointed at the production database registered itself as `http://localhost:3000` in the shared registry, so production placement could send players to localhost. Such servers no longer register
+- ⬜ **Fly trial limit:** machines stop after 5 minutes until a card is added (owner)
 
 ## Later
 - Ranking (rating on `player_stats` + `rating_history`)

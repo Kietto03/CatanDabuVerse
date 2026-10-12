@@ -4115,6 +4115,15 @@ EXIT_WHEN_DRAINED = os.environ.get("EXIT_WHEN_DRAINED") == "1"
 _server_status = 'active'
 
 
+def _local_server_on_shared_db():
+    """A dev machine (localhost URL) pointed at a remote database must not join the
+    production registry: placement would send real players to 'localhost'."""
+    from urllib.parse import urlparse
+    local = {'localhost', '127.0.0.1', '0.0.0.0', '::1'}
+    db_host = urlparse(os.environ.get('DATABASE_URL') or '').hostname
+    return urlparse(PUBLIC_URL).hostname in local and bool(db_host) and db_host not in local
+
+
 async def restore_match(match_id):
     """Rebuild a match taken over from a dead server from its last checkpoint."""
     import json, time
@@ -4215,7 +4224,11 @@ async def startup_event():
     await db.init()
     await db_matches.abandon_orphans_on_boot()
     await db_replays.load_config()
-    if await db_servers.register(PUBLIC_URL):
+    if _local_server_on_shared_db():
+        print("WARNING: PUBLIC_URL is a localhost address but DATABASE_URL is a remote database. "
+              "Not registering in the shared server registry, so players can't be routed to this machine. "
+              "Use the local Supabase stack for development (see docs/setup/supabase.md).")
+    elif await db_servers.register(PUBLIC_URL):
         print(f"Registered game server {db_servers.server_id} at {PUBLIC_URL}")
         asyncio.create_task(heartbeat_loop())
         asyncio.create_task(failover_loop())

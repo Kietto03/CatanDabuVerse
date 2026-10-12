@@ -23,6 +23,21 @@ The deploy job runs in the GitHub **environment `production`**. In repo Settings
 
 **Scaling out:** run a second Fly app (or region) with its own `PUBLIC_URL`. Two machines behind *one* Fly app URL would need `fly-replay` routing, which isn't implemented.
 
+## First-time Fly setup (already done for `catandabuverse`)
+
+```bash
+fly auth login
+fly apps create catandabuverse
+fly ips allocate-v4 --shared -a catandabuverse   # without public IPs the domain doesn't resolve
+fly ips allocate-v6 -a catandabuverse
+fly secrets import --stage -a catandabuverse      # DATABASE_URL, SUPABASE_URL, IP_HASH_SALT
+fly tokens create deploy -a catandabuverse        # → GitHub secret FLY_API_TOKEN
+```
+
+**Fly trial accounts stop machines after 5 minutes.** Add a card at https://fly.io/trial, then start the machine (`fly machine start -a catandabuverse`, or just redeploy).
+
+**Don't point a dev machine at production.** A server whose `PUBLIC_URL` is `localhost` won't register in the shared server registry when its `DATABASE_URL` is remote. Otherwise players on the live site could be routed to `localhost`. Develop against the local Supabase stack.
+
 ## Secrets and variables
 
 | Name | Where | What |
