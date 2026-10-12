@@ -128,7 +128,8 @@ jobs:
       - name: Deploy game server
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only --wait-timeout 300
+        # --ha=false: exactly one machine (rooms live in its memory; see fly.toml).
+        run: flyctl deploy --remote-only --ha=false --wait-timeout 300
 
       - name: Smoke test the live site
         run: |
