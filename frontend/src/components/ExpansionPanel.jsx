@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { useGameStore } from '../store/gameStore';
 
 const COMMODITY = { coin: { e: '🪙', n: 'Coin' }, cloth: { e: '🧵', n: 'Cloth' }, paper: { e: '📜', n: 'Paper' } };
@@ -74,8 +74,6 @@ export default function ExpansionPanel() {
   const myKnights = gameState.board.vertices
     .filter((v) => v.knight && v.knight.owner === me.index)
     .map((v) => ({ vid: v.id, ...v.knight }));
-
-  const otherName = (idx) => gameState.slots[idx]?.username || `P${idx}`;
 
   const playSimple = (card) => { playProgressCard(card); };
   const submitParam = () => {

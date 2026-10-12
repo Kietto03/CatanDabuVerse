@@ -5,6 +5,7 @@
 | [architecture.md](architecture.md) | How the system fits together today and after the Supabase move: game server, frontend, bots, database, auth |
 | [database/DATA_MODEL.md](database/DATA_MODEL.md) | Data model & identity design: tables, ERD, IAM (roles/permissions), replays, multi-server, RLS matrix, decisions |
 | [roadmap.md](roadmap.md) | The 6-step implementation plan with per-step checklists and status |
+| [deploy.md](deploy.md) | CI/CD pipeline, Fly.io hosting, secrets, deploy/rollback |
 | [setup/supabase.md](setup/supabase.md) | Running Supabase locally, configuring Google/Discord/email/guest login, deploying migrations to the hosted project, bootstrapping the first admin |
 
 Code that these docs describe:

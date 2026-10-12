@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useMemo } from 'react';
+import { useEffect, useRef, useState, useMemo } from 'react';
 import { useGameStore } from '../store/gameStore';
 import * as PIXI from 'pixi.js';
 
@@ -838,7 +838,6 @@ function BoardCanvas() {
 
     if (!prevDiceRolled && currentDiceRolled && lastRoll && (lastRoll[0] + lastRoll[1] !== 7) && !prefersReducedMotion()) {
       const roll = lastRoll[0] + lastRoll[1];
-      const scale = boardScale;
       
       gameState.board.hexes.forEach((hex) => {
         if (hex.number === roll && hex.resource !== 'desert' && hex.resource !== 'water') {
@@ -939,7 +938,7 @@ function BoardCanvas() {
           try {
             app.stage.removeChild(anim.pixiText);
             anim.pixiText.destroy();
-          } catch(e) {}
+          } catch { /* already destroyed */ }
         }
       });
       activeAnimationsRef.current = [];

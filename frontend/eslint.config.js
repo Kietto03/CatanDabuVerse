@@ -13,6 +13,14 @@ export default defineConfig([
       reactHooks.configs.flat.recommended,
       reactRefresh.configs.vite,
     ],
+    rules: {
+      // Advisory React-compiler rules: they flag patterns in working code
+      // (render-time randomness in confetti, syncing derived state in effects).
+      // Kept visible as warnings rather than failing CI.
+      'react-hooks/purity': 'warn',
+      'react-hooks/set-state-in-effect': 'warn',
+      'react-refresh/only-export-components': 'warn',
+    },
     languageOptions: {
       globals: globals.browser,
       parserOptions: { ecmaFeatures: { jsx: true } },

@@ -101,9 +101,6 @@ function PlayerDashboard() {
   const activePlayer = gameState.slots[gameState.currentPlayerIndex];
   const isMyTurn = activePlayer && activePlayer.id === socket.id;
 
-  const settlementsCount = me ? gameState.board.vertices.filter(v => v.owner === me.index && v.building === 'settlement').length : 0;
-  const citiesCount = me ? gameState.board.vertices.filter(v => v.owner === me.index && v.building === 'city').length : 0;
-  const roadsCount = me ? gameState.board.edges.filter(e => e.owner === me.index).length : 0;
 
   const hasEnoughForDev = me && me.resources.ore >= 1 && me.resources.wheat >= 1 && me.resources.sheep >= 1;
 

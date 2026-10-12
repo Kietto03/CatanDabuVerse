@@ -9,7 +9,7 @@ function playSound(type) {
   if (typeof window === 'undefined') return;
   try {
     if (useGameStore.getState().muteSound) return;
-  } catch (e) {}
+  } catch { /* store not ready yet */ }
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   }

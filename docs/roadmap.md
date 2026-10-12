@@ -65,6 +65,13 @@ Status legend: ✅ done · 🔄 in progress · ⬜ not started
 - ✅ In-game reporting (2026-10-12): ⚑ next to other human players in the top bar opens a report form (category + optional details) → `reports`. Live state now carries `matchId` and each seat's `userId` (stripped from replays). Migration `20261012000200_reports.sql`: no self-reports, details ≤ 1000 chars, one open report per reporter → player → match. Verified in Chrome (no button on self/bots, report stored with match, duplicate refused, replays carry no account ids) and pushed to the hosted project
 - ✅ Fixed while testing: the shared `Modal` now renders into `<body>` (portal). A dialog opened from the blurred top bar was trapped inside it, because `backdrop-filter` makes an ancestor the containing block for `position: fixed`
 
+## Step 7: CI/CD & deployment 🔄 (2026-10-12)
+- ✅ GitHub Actions `ci-cd.yml`: backend pytest (engine invariants, checkpoint codec, server Socket.IO smoke), frontend lint + build, all migrations on a fresh Postgres + schema checks, Docker build; on `main`: `supabase db push`, then `flyctl deploy`, then a live smoke test. See [deploy.md](deploy.md)
+- ✅ `Dockerfile` (web build + Python 3.13 server, non-root) and `.dockerignore`; image verified locally against the hosted project (DB, registration, hosted login over Socket.IO)
+- ✅ `fly.toml`: `sin`, always-on single machine, health check, rolling deploys with game handover
+- ✅ Frontend lint is now a real gate: 29 old errors fixed (unused imports and variables, empty catches); three advisory React-compiler rules downgraded to warnings
+- ⬜ Fly account + app + secrets, GitHub secrets, first deploy
+
 ## Later
 - Ranking (rating on `player_stats` + `rating_history`)
 - Friends & invites (`friendships` table already exists)
