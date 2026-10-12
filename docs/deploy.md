@@ -8,7 +8,7 @@ pull request / push ─┬─ Backend tests      pytest: engine invariants, chec
                      ├─ Migrations         all supabase/migrations applied to a fresh Postgres + schema checks (RLS on every table)
                      └─ Docker             production image builds
 push to main ────────┴─▶ Migrate           supabase db push (new migrations)
-                         └─▶ Deploy        Render deploy hook for this commit ─▶ wait until /api/health reports it
+                         └─▶ Deploy        Render API deploy of this commit ─▶ follow until live ─▶ /api/health (commit + DB)
                                            (or flyctl deploy when DEPLOY_TARGET=fly)
 ```
 
@@ -33,10 +33,13 @@ The deploy job runs in the GitHub **environment `production`**. In repo Settings
 ### First-time Render setup
 1. Sign in at https://render.com with GitHub (no card needed) and allow access to this repository.
 2. **New → Blueprint →** pick this repo. Render reads `render.yaml` and asks for `DATABASE_URL`: use the session-pooler URL with the URL-encoded password (see `setup/supabase.md`).
-3. In the new service: **Settings → Deploy Hook**, copy the URL, then `gh secret set RENDER_DEPLOY_HOOK_URL` and `gh variable set RENDER_URL --body https://<service>.onrender.com`.
-4. Add `https://<service>.onrender.com/**` to the Supabase redirect allow-list and make it the Site URL.
+3. Make sure the service has `DATABASE_URL` under **Environment** (the Blueprint prompt can be skipped by accident; `/api/health` then shows `"database": false`).
+4. Create an API key (**Account Settings → API Keys**), then `gh secret set RENDER_API_KEY`, `gh variable set RENDER_SERVICE_ID --body srv-…` and `gh variable set RENDER_URL --body https://<service>.onrender.com`.
+5. Add `https://<service>.onrender.com/**` to the Supabase redirect allow-list and make it the Site URL.
 
-From then on, every merge to `main` runs CI, migrates the database, triggers the Render deploy for that commit, and waits until `/api/health` reports the new commit.
+From then on, every merge to `main` runs CI, migrates the database, creates a Render deploy for that exact commit through the API, follows it until it's `live` (failing the run if the build or update fails), and checks that `/api/health` reports the new commit with the database connected.
+
+Note: a Blueprint's own sync hook (`exs-…`) only applies `render.yaml` changes. It doesn't redeploy code, which is why the pipeline uses the API.
 
 ## Alternative: Fly.io (paid, always on)
 
@@ -61,7 +64,8 @@ fly tokens create deploy -a catandabuverse        # → GitHub secret FLY_API_TO
 
 | Name | Where | What |
 |---|---|---|
-| `RENDER_DEPLOY_HOOK_URL` | GitHub secret | Render service → Settings → Deploy Hook |
+| `RENDER_API_KEY` | GitHub secret | Render API key (account-wide; used to create and follow deploys) |
+| `RENDER_SERVICE_ID` | GitHub variable | `srv-db68c0g473hc73dhgfe0` |
 | `RENDER_URL` | GitHub variable | `https://<service>.onrender.com` (used by the post-deploy check) |
 | `SUPABASE_URL`, `SUPABASE_ANON_KEY` | GitHub variables | Public values for the keep-alive job |
 | `DEPLOY_TARGET` | GitHub variable | unset = Render, `fly` = Fly.io |
