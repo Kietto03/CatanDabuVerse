@@ -1,4 +1,3 @@
-import React from 'react';
 
 // Tiny SVG thumbnail of a map's topology (land / water / gold cells).
 // `hexes` is the metadata array from /api/maps: [{ q, r, kind }].

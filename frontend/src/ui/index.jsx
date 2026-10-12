@@ -2,7 +2,6 @@
    UI primitives (Light modern) — dùng chung toàn app.
    Thay style neo-brutalist inline lặp lại. Có framer-motion.
    ============================================================ */
-import React from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 

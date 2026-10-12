@@ -1,4 +1,4 @@
-import React, { Suspense, lazy } from 'react';
+import { Suspense, lazy } from 'react';
 import { MotionConfig } from 'framer-motion';
 import { useGameStore } from './store/gameStore';
 import Lobby from './components/Lobby';

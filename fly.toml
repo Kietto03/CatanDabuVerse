@@ -1,0 +1,53 @@
+# Fly.io app for the CatanDabuVerse game server (deployed by GitHub Actions).
+# Secrets (set once with `fly secrets set`): DATABASE_URL, SUPABASE_URL, IP_HASH_SALT.
+
+app = "catandabuverse"
+primary_region = "sin"            # Singapore, next to the Supabase project (ap-southeast-1)
+
+# Graceful handover on deploy/restart: on SIGTERM the server checkpoints every
+# live game and marks itself dead; the new machine claims the games and
+# players reconnect (see docs/database/DATA_MODEL.md §6.6).
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  [build.args]
+    # Public build-time values for the web app (the anon key is public by design).
+    VITE_SUPABASE_URL = "https://aeihqbeuqhopxtocelpd.supabase.co"
+    VITE_SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFlaWhxYmV1cWhvcHh0b2NlbHBkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE3NTA2NTYsImV4cCI6MjEwNzMyNjY1Nn0.pZ_TxGy3oBgSn4Wv0JGXjJFfra0CCmVwnOCHRgb-zFw"
+
+[deploy]
+  # One machine behind one URL: replace it in place (old hands games over,
+  # new takes them over). Blue-green would briefly run two machines behind the
+  # same address, which the room routing doesn't support without fly-replay.
+  strategy = "rolling"
+
+[env]
+  PORT = "8080"
+  PUBLIC_URL = "https://catandabuverse.fly.dev"
+  SERVER_REGION = "sin"
+  FAILOVER_INTERVAL_SECONDS = "10"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Games live in memory: never stop the machine for being idle.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 800
+    hard_limit = 1000
+
+  [[http_service.checks]]
+    grace_period = "20s"
+    interval = "15s"
+    timeout = "5s"
+    method = "GET"
+    path = "/api/maps"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
