@@ -121,41 +121,56 @@ jobs:
           supabase link --project-ref "${{ vars.SUPABASE_PROJECT_REF }}"
           supabase db push --yes
 
-  # Default host: Render free web service (render.yaml). Triggered through the
-  # service's deploy hook for this exact commit, then we wait until it's live.
+  # Default host: Render free web service (render.yaml). Deploys this exact
+  # commit through the Render API and follows that deploy until it's live.
   deploy-render:
     name: Deploy to Render
     if: vars.DEPLOY_TARGET != 'fly'
     needs: [migrate]
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     environment:
       name: production
       url: ${{ vars.RENDER_URL }}
     concurrency:
       group: deploy-production
       cancel-in-progress: false
+    env:
+      RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+      SERVICE: ${{ vars.RENDER_SERVICE_ID }}
     steps:
-      - name: Trigger deploy
-        env:
-          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+      - name: Deploy and wait until live
         run: |
-          if [ -z "$HOOK" ]; then
-            echo "::warning::RENDER_DEPLOY_HOOK_URL is not set; skipping deploy (see docs/deploy.md)."
+          if [ -z "$RENDER_API_KEY" ] || [ -z "$SERVICE" ]; then
+            echo "::warning::RENDER_API_KEY / RENDER_SERVICE_ID not set; skipping deploy (see docs/deploy.md)."
             exit 0
           fi
-          curl -fsS -X POST "$HOOK&ref=${GITHUB_SHA}" > /dev/null
-          echo "deploy of ${GITHUB_SHA} requested"
-      - name: Wait until this commit is live
-        if: vars.RENDER_URL != ''
-        run: |
-          # Free instances build slowly and may need to wake up: allow ~20 min.
-          for i in $(seq 1 120); do
-            live=$(curl -fsS -m 20 "${{ vars.RENDER_URL }}/api/health" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('commit') or '')" 2>/dev/null || true)
-            if [ "$live" = "$GITHUB_SHA" ]; then echo "live: $live"; exit 0; fi
+          api() { curl -fsS -H "Authorization: Bearer $RENDER_API_KEY" -H "Content-Type: application/json" "$@"; }
+          dep=$(api -X POST "https://api.render.com/v1/services/$SERVICE/deploys" -d "{\"commitId\":\"$GITHUB_SHA\"}" \
+                | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          echo "Render deploy $dep for $GITHUB_SHA"
+          # Free instances build slowly: allow ~25 min.
+          for i in $(seq 1 150); do
+            status=$(api "https://api.render.com/v1/services/$SERVICE/deploys/$dep" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+            case "$status" in
+              live) echo "deploy is live"; exit 0 ;;
+              build_failed|update_failed|canceled|deactivated|pre_deploy_failed)
+                echo "::error::Render deploy $dep ended with status $status"; exit 1 ;;
+            esac
             sleep 10
           done
-          echo "commit $GITHUB_SHA did not go live (last seen: ${live:-none})" && exit 1
+          echo "::error::Render deploy $dep still '$status' after 25 minutes"; exit 1
+      - name: Health check (new commit, database connected)
+        if: vars.RENDER_URL != '' && env.RENDER_API_KEY != ''
+        run: |
+          for i in $(seq 1 30); do
+            out=$(curl -fsS -m 60 "${{ vars.RENDER_URL }}/api/health" 2>/dev/null || true)
+            if echo "$out" | python3 -c "import json,sys,os; d=json.load(sys.stdin); sys.exit(0 if d.get('commit')==os.environ['GITHUB_SHA'] and d.get('database') else 1)" 2>/dev/null; then
+              echo "healthy: $out"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::health check failed: ${out:-no response}"; exit 1
 
   # Optional host: Fly.io (fly.toml). Set repository variable DEPLOY_TARGET=fly.
   deploy-fly:
