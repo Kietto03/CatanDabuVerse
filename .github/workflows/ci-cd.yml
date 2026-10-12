@@ -1,8 +1,8 @@
 name: CI/CD
 
 # Pull requests: build + test everything.
-# Push to main:  the same checks, then migrate the Supabase database and
-#                deploy the game server to Fly.io.
+# Push to main:  the same checks, then migrate the Supabase database and deploy
+#                the game server: Render (default, free) or Fly.io (DEPLOY_TARGET=fly).
 on:
   push:
     branches: [main]
@@ -94,25 +94,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy:
-    name: Deploy (Supabase migrations + Fly.io)
+  migrate:
+    name: Migrate production database
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     needs: [backend, frontend, migrations, docker]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment:
-      name: production
-      url: https://catandabuverse.fly.dev
+    timeout-minutes: 15
+    environment: production
     concurrency:
       group: deploy-production
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
       - uses: supabase/setup-cli@v1
         with:
           version: latest
-      - name: Apply new database migrations
+      - name: Apply new migrations to Supabase
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
           SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
@@ -124,17 +121,67 @@ jobs:
           supabase link --project-ref "${{ vars.SUPABASE_PROJECT_REF }}"
           supabase db push --yes
 
+  # Default host: Render free web service (render.yaml). Triggered through the
+  # service's deploy hook for this exact commit, then we wait until it's live.
+  deploy-render:
+    name: Deploy to Render
+    if: vars.DEPLOY_TARGET != 'fly'
+    needs: [migrate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment:
+      name: production
+      url: ${{ vars.RENDER_URL }}
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Trigger deploy
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "::warning::RENDER_DEPLOY_HOOK_URL is not set; skipping deploy (see docs/deploy.md)."
+            exit 0
+          fi
+          curl -fsS -X POST "$HOOK&ref=${GITHUB_SHA}" > /dev/null
+          echo "deploy of ${GITHUB_SHA} requested"
+      - name: Wait until this commit is live
+        if: vars.RENDER_URL != ''
+        run: |
+          # Free instances build slowly and may need to wake up: allow ~20 min.
+          for i in $(seq 1 120); do
+            live=$(curl -fsS -m 20 "${{ vars.RENDER_URL }}/api/health" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('commit') or '')" 2>/dev/null || true)
+            if [ "$live" = "$GITHUB_SHA" ]; then echo "live: $live"; exit 0; fi
+            sleep 10
+          done
+          echo "commit $GITHUB_SHA did not go live (last seen: ${live:-none})" && exit 1
+
+  # Optional host: Fly.io (fly.toml). Set repository variable DEPLOY_TARGET=fly.
+  deploy-fly:
+    name: Deploy to Fly.io
+    if: vars.DEPLOY_TARGET == 'fly'
+    needs: [migrate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: https://catandabuverse.fly.dev
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy game server
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         # --ha=false: exactly one machine (rooms live in its memory; see fly.toml).
         run: flyctl deploy --remote-only --ha=false --wait-timeout 300
-
       - name: Smoke test the live site
         run: |
           for i in $(seq 1 30); do
-            if curl -fsS https://catandabuverse.fly.dev/api/maps > /dev/null; then echo "live"; exit 0; fi
+            if curl -fsS https://catandabuverse.fly.dev/api/health > /dev/null; then echo "live"; exit 0; fi
             sleep 5
           done
           echo "site did not come up" && exit 1

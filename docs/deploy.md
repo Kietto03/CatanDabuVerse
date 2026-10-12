@@ -7,23 +7,42 @@ pull request / push ─┬─ Backend tests      pytest: engine invariants, chec
                      ├─ Frontend           eslint (0 errors) + vite build
                      ├─ Migrations         all supabase/migrations applied to a fresh Postgres + schema checks (RLS on every table)
                      └─ Docker             production image builds
-push to main ────────┴─▶ Deploy            supabase db push (new migrations) ─▶ flyctl deploy ─▶ smoke test https://catandabuverse.fly.dev
+push to main ────────┴─▶ Migrate           supabase db push (new migrations)
+                         └─▶ Deploy        Render deploy hook for this commit ─▶ wait until /api/health reports it
+                                           (or flyctl deploy when DEPLOY_TARGET=fly)
 ```
 
 The deploy job runs in the GitHub **environment `production`**. In repo Settings → Environments you can require a reviewer before each deploy.
 
-## Hosting
+## Hosting (free)
 
-| Piece | Where |
-|---|---|
-| Game server + web app | Fly.io app `catandabuverse`, region `sin`, one always-on `shared-cpu-1x` (512 MB) machine. Image built from the `Dockerfile` |
-| Database, auth | Supabase project `aeihqbeuqhopxtocelpd` (ap-southeast-1) |
+| Piece | Where | Cost |
+|---|---|---|
+| Game server + web app | **Render** free web service `catandabuverse` (Singapore), built from the `Dockerfile` via `render.yaml` | $0 |
+| Database, auth | Supabase project `aeihqbeuqhopxtocelpd` (ap-southeast-1), free plan | $0 |
+| CI/CD | GitHub Actions (public repo) | $0 |
 
-**Deploys keep games alive:** Fly stops the old machine with SIGTERM, which checkpoints every live game and hands it over. The new machine takes the games over within ~10 s (`FAILOVER_INTERVAL_SECONDS`), and players' browsers reconnect automatically.
+**What "free" means on Render**
+- The service **sleeps after 15 minutes with no HTTP requests or WebSocket messages**. The next visitor waits about 1 minute while it wakes. Running games send messages constantly, so a game in progress keeps it awake.
+- 750 instance-hours a month, enough for one always-on service. Outbound bandwidth comes from the workspace's included 5 GB/month. A game uses a few MB, and the first page load about 0.5 MB.
+- Render may restart a free service at any time. Live games survive that through the checkpoint + takeover path.
+- If the limits are exceeded without a card on file, Render suspends the service until the next month.
 
-**Scaling out:** run a second Fly app (or region) with its own `PUBLIC_URL`. Two machines behind *one* Fly app URL would need `fly-replay` routing, which isn't implemented.
+**Supabase free projects pause after ~7 days without activity.** `.github/workflows/keepalive.yml` reads a public table every 3 days to prevent that.
 
-## First-time Fly setup (already done for `catandabuverse`)
+### First-time Render setup
+1. Sign in at https://render.com with GitHub (no card needed) and allow access to this repository.
+2. **New → Blueprint →** pick this repo. Render reads `render.yaml` and asks for `DATABASE_URL`: use the session-pooler URL with the URL-encoded password (see `setup/supabase.md`).
+3. In the new service: **Settings → Deploy Hook**, copy the URL, then `gh secret set RENDER_DEPLOY_HOOK_URL` and `gh variable set RENDER_URL --body https://<service>.onrender.com`.
+4. Add `https://<service>.onrender.com/**` to the Supabase redirect allow-list and make it the Site URL.
+
+From then on, every merge to `main` runs CI, migrates the database, triggers the Render deploy for that commit, and waits until `/api/health` reports the new commit.
+
+## Alternative: Fly.io (paid, always on)
+
+Set the repository variable `DEPLOY_TARGET=fly` to deploy with `fly.toml` instead (needs a card on the Fly account, ~$3–5/month for one machine). The Fly app `catandabuverse` exists but is scaled to **0 machines**, so it costs nothing. The next Fly deploy recreates the machine.
+
+### First-time Fly setup (already done for `catandabuverse`)
 
 ```bash
 fly auth login
@@ -42,11 +61,16 @@ fly tokens create deploy -a catandabuverse        # → GitHub secret FLY_API_TO
 
 | Name | Where | What |
 |---|---|---|
-| `FLY_API_TOKEN` | GitHub secret | Deploy token for the Fly app (`fly tokens create deploy`) |
+| `RENDER_DEPLOY_HOOK_URL` | GitHub secret | Render service → Settings → Deploy Hook |
+| `RENDER_URL` | GitHub variable | `https://<service>.onrender.com` (used by the post-deploy check) |
+| `SUPABASE_URL`, `SUPABASE_ANON_KEY` | GitHub variables | Public values for the keep-alive job |
+| `DEPLOY_TARGET` | GitHub variable | unset = Render, `fly` = Fly.io |
+| `FLY_API_TOKEN` | GitHub secret | Only for `DEPLOY_TARGET=fly` |
 | `SUPABASE_ACCESS_TOKEN` | GitHub secret | Supabase personal access token (for `supabase db push`) |
 | `SUPABASE_DB_PASSWORD` | GitHub secret | Database password |
 | `SUPABASE_PROJECT_REF` | GitHub variable | `aeihqbeuqhopxtocelpd` |
-| `DATABASE_URL`, `SUPABASE_URL`, `IP_HASH_SALT` | Fly secrets | Server runtime config (`fly secrets set ...`) |
+| `DATABASE_URL` | Render env (secret) / Fly secret | Server database connection |
+| `SUPABASE_URL`, `IP_HASH_SALT`, `VITE_*`, `FAILOVER_INTERVAL_SECONDS` | `render.yaml` / `fly.toml` | Non-secret config (`IP_HASH_SALT` is generated by Render) |
 | `PUBLIC_URL`, `PORT`, `SERVER_REGION`, `FAILOVER_INTERVAL_SECONDS` | `fly.toml` `[env]` | Non-secret runtime config |
 | `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` | `fly.toml` `[build.args]` | Public values baked into the web app |
 
